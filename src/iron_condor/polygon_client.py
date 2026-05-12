@@ -25,10 +25,10 @@ log = logging.getLogger(__name__)
 
 BASE_URL = "https://api.polygon.io"
 DEFAULT_CACHE_DIR = Path(__file__).resolve().parents[2] / "data" / "cache"
-RATE_LIMIT_PER_SEC = 25           # Options Advanced/Developer is effectively unlimited;
-                                  # 25/s is fast enough for an annual sweep without
-                                  # being abusive.
-MAX_RETRIES = 5
+RATE_LIMIT_PER_SEC = 10           # Conservative default. Bump in .env via
+                                  # POLYGON_RATE_LIMIT_PER_SEC if your plan has
+                                  # real headroom and you stop seeing 429s.
+MAX_RETRIES = 10
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +67,7 @@ class PolygonClient:
         self,
         api_key: str | None = None,
         cache_dir: Path | None = None,
-        rate_per_sec: int = RATE_LIMIT_PER_SEC,
+        rate_per_sec: int | None = None,
     ) -> None:
         load_dotenv()
         self.api_key = api_key or os.environ.get("POLYGON_API_KEY")
@@ -78,6 +78,11 @@ class PolygonClient:
         self.cache_dir = Path(cache_dir or DEFAULT_CACHE_DIR)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.session = requests.Session()
+        if rate_per_sec is None:
+            rate_per_sec = int(
+                os.environ.get("POLYGON_RATE_LIMIT_PER_SEC", RATE_LIMIT_PER_SEC)
+            )
+        log.info("PolygonClient throttle = %d req/s", rate_per_sec)
         self.throttle = _Throttle(rate_per_sec)
 
     # ------------------------------------------------------------------
@@ -88,22 +93,30 @@ class PolygonClient:
         params = dict(params or {})
         params["apiKey"] = self.api_key
         url = f"{BASE_URL}{path}"
-        backoff = 1.0
         for attempt in range(MAX_RETRIES):
             self.throttle.wait()
             resp = self.session.get(url, params=params, timeout=30)
             if resp.status_code == 200:
                 return resp.json()
-            if resp.status_code in (429, 502, 503, 504):
+            if resp.status_code == 429:
+                # Polygon's rate-limit window is per minute. Honor Retry-After
+                # if provided, otherwise wait a full minute for the bucket to
+                # refill.
+                retry_after = resp.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after else 60.0
                 log.warning(
-                    "Polygon %s -> %s, sleeping %.1fs (attempt %d)",
-                    path,
-                    resp.status_code,
-                    backoff,
-                    attempt + 1,
+                    "Polygon %s -> 429 rate-limited, sleeping %.0fs (attempt %d/%d)",
+                    path, wait, attempt + 1, MAX_RETRIES,
                 )
-                _time.sleep(backoff)
-                backoff *= 2
+                _time.sleep(wait)
+                continue
+            if resp.status_code in (502, 503, 504):
+                wait = min(60.0, 2.0 ** attempt)
+                log.warning(
+                    "Polygon %s -> %s, sleeping %.0fs (attempt %d/%d)",
+                    path, resp.status_code, wait, attempt + 1, MAX_RETRIES,
+                )
+                _time.sleep(wait)
                 continue
             resp.raise_for_status()
         raise RuntimeError(f"Polygon {path} failed after {MAX_RETRIES} retries")
