@@ -106,21 +106,26 @@ def _round_trip_fees(qty: int, params: StrategyParams) -> float:
     """Commissions + slippage for opening AND closing the 4-leg combo.
 
     - Commission is per option contract, charged on every leg, both sides.
-    - Slippage is applied once per side at the COMBO net price (you cross
-      the bid-ask on the package, not on each leg independently).
+    - Slippage is the FULL bid-ask spread on the combo, paid once per round
+      trip (you cross one spread total: buy at ask on entry, sell at bid on
+      exit; halves on each side sum to one full spread).
     """
     legs = 4
     sides = 2
     commission = qty * legs * sides * params.commission_per_contract
-    slippage = qty * sides * params.combo_slippage_per_share * 100
+    slippage = qty * params.combo_slippage_per_share * 100
     return commission + slippage
 
 
 def _open_costs(qty: int, params: StrategyParams) -> float:
-    """Fees paid when entering only (used for position sizing)."""
+    """Fees paid at entry only (used for position sizing).
+
+    Half the round-trip slippage is paid on entry (you cross half the spread
+    above mid when buying); the other half on exit.
+    """
     return (
         qty * 4 * params.commission_per_contract
-        + qty * params.combo_slippage_per_share * 100
+        + qty * 0.5 * params.combo_slippage_per_share * 100
     )
 
 
@@ -213,7 +218,7 @@ def simulate_day(
     per_contract_open = (
         entry_debit * 100
         + 4 * params.commission_per_contract
-        + params.combo_slippage_per_share * 100
+        + 0.5 * params.combo_slippage_per_share * 100
     )
     qty = int(floor(capital / per_contract_open))
     if qty < 1:

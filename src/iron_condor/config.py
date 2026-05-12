@@ -58,11 +58,11 @@ class StrategyParams:
     # Default = $0.85/contract one-way, calibrated from user's real IBKR fills
     # ($27.14 round-trip for 16 contracts -> $0.85 per contract per side).
     commission_per_contract: float = 0.85
-    # Slippage is applied at the COMBO net price, once per side (open + close).
-    # 4-leg ICs are submitted as a single combo order at IBKR / Tastytrade /
-    # Schwab, so you cross the bid-ask once on the package, not four times.
-    # $0.05/share per side ≈ $10 round-trip friction on one IC.
-    combo_slippage_per_share: float = 0.05
+    # Bid-ask spread cost paid per round trip on the 4-leg combo (one full
+    # spread crossed total: buy at ask on entry, sell at bid on exit).
+    # SPY 0DTE leg spreads are ~$0.01-0.02; the net combo spread with patient
+    # limit orders is similar. $0.02 is mid-conservative.
+    combo_slippage_per_share: float = 0.02
 
     # Account
     starting_balance: float = 1500.0
