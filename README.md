@@ -1,11 +1,16 @@
 # SPY 0DTE Long Iron Condor Backtester
 
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/coolin815/iron-condor/blob/claude/spy-options-trading-bot-ri4Ms/notebooks/run.ipynb)
+
 Backtest a **long (reverse) iron condor** on SPY 0DTE options. The thesis is
 non-directional: when intraday RSI hits an extreme, SPY is more likely to make a
 large move (either continuation or reversal), and a long condor profits from a
 breakout in either direction.
 
 Full strategy spec: see `condor strategy brief.md`.
+
+**Running on a phone?** Tap the Colab badge above. No install required — paste
+your Polygon key when prompted and step through the cells.
 
 ## What it does
 
