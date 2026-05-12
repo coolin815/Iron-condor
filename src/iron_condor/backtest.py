@@ -340,7 +340,7 @@ def run_sweep(
             stop_loss_pct=sl,
             strike_rule=sr,
             commission_per_contract=base.commission_per_contract,
-            slippage_per_contract=base.slippage_per_contract,
+            combo_slippage_per_share=base.combo_slippage_per_share,
             starting_balance=base.starting_balance,
             max_capital_per_trade=base.max_capital_per_trade,
         )
