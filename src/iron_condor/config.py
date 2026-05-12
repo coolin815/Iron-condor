@@ -56,7 +56,7 @@ class StrategyParams:
 
     # Execution assumptions
     commission_per_contract: float = 0.65
-    slippage_per_contract: float = 0.02   # extra $ paid per leg per side beyond mid
+    slippage_per_contract: float = 0.05   # $/share per leg per side beyond mid
 
     # Account
     starting_balance: float = 1500.0
@@ -71,6 +71,18 @@ class StrategyParams:
 RSI_PERIODS: tuple[int, ...] = (9, 14)
 
 PROFIT_TARGETS: tuple[float, ...] = (0.10, 0.15, 0.20, 0.25, 0.30)
+
+STOP_LOSSES: tuple[float, ...] = (0.25, 0.35, 0.50)
+
+# Entry-window cutoffs in NY (ET) time. PT in parens for sanity:
+#   12:30 ET = 9:30 PT,  13:00 ET = 10:00 PT,
+#   13:30 ET = 10:30 PT, 14:00 ET = 11:00 PT
+ENTRY_CUTOFFS: tuple[time, ...] = (
+    time(12, 30),
+    time(13, 0),
+    time(13, 30),
+    time(14, 0),
+)
 
 STRIKE_RULES: tuple[StrikeRule, ...] = (
     # Fixed offsets from the brief: $1.50–$2 inner, $3–$4 wings.

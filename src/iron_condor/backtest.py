@@ -12,8 +12,10 @@ import pandas as pd
 from tqdm import tqdm
 
 from .config import (
+    ENTRY_CUTOFFS,
     PROFIT_TARGETS,
     RSI_PERIODS,
+    STOP_LOSSES,
     STRIKE_RULES,
     StrategyParams,
     StrikeRule,
@@ -36,6 +38,8 @@ class TradeResult:
     rsi_period: int
     strike_rule: str
     profit_target: float
+    stop_loss: float
+    entry_cutoff: str
     signal_time: datetime | None
     signal_direction: str | None
     signal_spot: float | None
@@ -133,6 +137,8 @@ def simulate_day(
         rsi_period=params.rsi_period,
         strike_rule=params.strike_rule.name,
         profit_target=params.profit_target_pct,
+        stop_loss=params.stop_loss_pct,
+        entry_cutoff=params.latest_entry.strftime("%H:%M"),
         signal_time=None,
         signal_direction=None,
         signal_spot=None,
@@ -274,7 +280,13 @@ def run_backtest(
     days = _trading_days(start, end)
     balance = params.starting_balance
     results: list[TradeResult] = []
-    for day in tqdm(days, desc=f"{params.strike_rule.name}|rsi{params.rsi_period}|pt{int(params.profit_target_pct*100)}"):
+    desc = (
+        f"{params.strike_rule.name}|rsi{params.rsi_period}"
+        f"|pt{int(params.profit_target_pct*100)}"
+        f"|sl{int(params.stop_loss_pct*100)}"
+        f"|co{params.latest_entry.strftime('%H%M')}"
+    )
+    for day in tqdm(days, desc=desc):
         result = simulate_day(day, params, balance, client)
         balance = result.balance_after
         results.append(result)
@@ -287,10 +299,12 @@ def run_sweep(
     rsi_periods: Iterable[int] = RSI_PERIODS,
     strike_rules: Iterable[StrikeRule] = STRIKE_RULES,
     profit_targets: Iterable[float] = PROFIT_TARGETS,
+    stop_losses: Iterable[float] = STOP_LOSSES,
+    entry_cutoffs=ENTRY_CUTOFFS,
     base_params: StrategyParams | None = None,
     client: PolygonClient | None = None,
 ) -> pd.DataFrame:
-    """Run every (rsi_period × strike_rule × profit_target) combination.
+    """Run every (rsi × strike_rule × profit_target × stop_loss × entry_cutoff) combo.
 
     Returns a single DataFrame with a 'config' column distinguishing runs.
     """
@@ -299,22 +313,24 @@ def run_sweep(
     all_rows: list[pd.DataFrame] = []
 
     combos = [
-        (rp, sr, pt)
+        (rp, sr, pt, sl, co)
         for rp in rsi_periods
         for sr in strike_rules
         for pt in profit_targets
+        for sl in stop_losses
+        for co in entry_cutoffs
     ]
-    for rp, sr, pt in combos:
+    for rp, sr, pt, sl, co in combos:
         params = StrategyParams(
             rsi_period=rp,
             rsi_upper=base.rsi_upper,
             rsi_lower=base.rsi_lower,
             earliest_entry=base.earliest_entry,
-            latest_entry=base.latest_entry,
+            latest_entry=co,
             time_stop=base.time_stop,
             hard_close=base.hard_close,
             profit_target_pct=pt,
-            stop_loss_pct=base.stop_loss_pct,
+            stop_loss_pct=sl,
             strike_rule=sr,
             commission_per_contract=base.commission_per_contract,
             slippage_per_contract=base.slippage_per_contract,
@@ -322,6 +338,8 @@ def run_sweep(
             max_capital_per_trade=base.max_capital_per_trade,
         )
         df = run_backtest(params, start, end, client=client)
-        df["config"] = f"{sr.name}|rsi{rp}|pt{int(pt*100)}"
+        df["config"] = (
+            f"{sr.name}|rsi{rp}|pt{int(pt*100)}|sl{int(sl*100)}|co{co.strftime('%H%M')}"
+        )
         all_rows.append(df)
     return pd.concat(all_rows, ignore_index=True)

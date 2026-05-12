@@ -25,7 +25,9 @@ log = logging.getLogger(__name__)
 
 BASE_URL = "https://api.polygon.io"
 DEFAULT_CACHE_DIR = Path(__file__).resolve().parents[2] / "data" / "cache"
-RATE_LIMIT_PER_SEC = 3            # 3 req/s — well under Developer-plan cap
+RATE_LIMIT_PER_SEC = 25           # Options Advanced/Developer is effectively unlimited;
+                                  # 25/s is fast enough for an annual sweep without
+                                  # being abusive.
 MAX_RETRIES = 5
 
 
