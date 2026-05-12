@@ -55,9 +55,10 @@ class StrategyParams:
     )
 
     # Execution assumptions
-    # Default = Robinhood-like (pass-through regulatory only). For IBKR / Schwab
-    # set to ~0.65; for Tastytrade ~0.50 round-trip averaged.
-    commission_per_contract: float = 0.04
+    # Default = IBKR Pro Fixed ($0.65/contract, plus negligible regulatory).
+    # IBKR Pro Tiered users can drop this to ~0.30; Robinhood ~0.04;
+    # Tastytrade caps at ~$0.50 round-trip-averaged.
+    commission_per_contract: float = 0.65
     # Slippage is applied at the COMBO net price, once per side (open + close).
     # 4-leg ICs are submitted as a single combo order at IBKR / Tastytrade /
     # Schwab, so you cross the bid-ask once on the package, not four times.
