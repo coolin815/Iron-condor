@@ -48,8 +48,8 @@ class TradeResult:
     long_call: float | None
     short_call: float | None
     qty: int
-    entry_debit: float | None
-    exit_debit: float | None
+    entry_debit: float | None     # paid at ask-side combo on entry
+    exit_credit: float | None     # received at bid-side combo on exit
     exit_time: datetime | None
     exit_reason: str          # 'no_signal', 'no_data', 'profit', 'stop', 'time_stop'
     gross_pnl: float
@@ -86,10 +86,23 @@ def _reindex_minute_bars(
     return bars.reindex(grid).ffill()
 
 
-def _spread_mid(
-    leg_bars: dict[str, pd.DataFrame], ts: pd.Timestamp
+def _combo_price(
+    leg_bars: dict[str, pd.DataFrame],
+    ts: pd.Timestamp,
+    half_spread: float,
+    action: str,
 ) -> float | None:
-    """Long-IC debit per share at time `ts`: long_put + long_call - short_put - short_call."""
+    """Long-IC combo price at `ts`, synthesized from 1-min closes + half spread.
+
+    - action="enter": you BUY the combo. Pay ASK on long legs, sell at BID on
+      shorts. Returns the debit per share you'd pay.
+    - action="exit":  you SELL the combo. Sell at BID on long legs, buy at
+      ASK on shorts. Returns the credit per share you'd receive.
+
+    Equivalent to: combo_mid + 4*h on entry, combo_mid - 4*h on exit.
+    Slippage is therefore baked into the entry/exit numbers — no separate
+    deduction needed.
+    """
     try:
         lp = leg_bars["long_put"].loc[ts, "close"]
         sp = leg_bars["short_put"].loc[ts, "close"]
@@ -99,34 +112,31 @@ def _spread_mid(
         return None
     if pd.isna(lp) or pd.isna(sp) or pd.isna(lc) or pd.isna(sc):
         return None
-    return float(lp + lc - sp - sc)
+    h = half_spread
+    if action == "enter":
+        # buy longs at ask (mid+h), sell shorts at bid (mid-h)
+        return float((lp + h) + (lc + h) - (sp - h) - (sc - h))
+    # exit: sell longs at bid (mid-h), buy shorts at ask (mid+h)
+    return float((lp - h) + (lc - h) - (sp + h) - (sc + h))
 
 
 def _round_trip_fees(qty: int, params: StrategyParams) -> float:
-    """Commissions + slippage for opening AND closing the 4-leg combo.
+    """Commission cost for opening AND closing the 4-leg combo.
 
-    - Commission is per option contract, charged on every leg, both sides.
-    - Slippage is the FULL bid-ask spread on the combo, paid once per round
-      trip (you cross one spread total: buy at ask on entry, sell at bid on
-      exit; halves on each side sum to one full spread).
+    Slippage / bid-ask cost is already baked into entry_debit (ask-side) and
+    exit_credit (bid-side), so this is commissions only.
     """
     legs = 4
     sides = 2
-    commission = qty * legs * sides * params.commission_per_contract
-    slippage = qty * params.combo_slippage_per_share * 100
-    return commission + slippage
+    return qty * legs * sides * params.commission_per_contract
 
 
 def _open_costs(qty: int, params: StrategyParams) -> float:
-    """Fees paid at entry only (used for position sizing).
+    """Commissions paid at entry (used for position sizing).
 
-    Half the round-trip slippage is paid on entry (you cross half the spread
-    above mid when buying); the other half on exit.
+    entry_debit already includes the spread above mid on the buy side.
     """
-    return (
-        qty * 4 * params.commission_per_contract
-        + qty * 0.5 * params.combo_slippage_per_share * 100
-    )
+    return qty * 4 * params.commission_per_contract
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +168,7 @@ def simulate_day(
         short_call=None,
         qty=0,
         entry_debit=None,
-        exit_debit=None,
+        exit_credit=None,
         exit_time=None,
         exit_reason="no_signal",
         gross_pnl=0.0,
@@ -207,19 +217,16 @@ def simulate_day(
             return base
 
     entry_ts = pd.Timestamp(signal.timestamp).tz_convert("America/New_York").floor("min")
-    entry_debit = _spread_mid(leg_bars, entry_ts)
+    h = params.leg_half_spread
+    entry_debit = _combo_price(leg_bars, entry_ts, h, "enter")
     if entry_debit is None or entry_debit <= 0.05:
         # Non-positive debit means our legs are mis-ordered or data is bad.
         base.exit_reason = "no_data"
         return base
 
-    # Position sizing: full balance up to the cap.
+    # Position sizing: full balance up to the cap. entry_debit is already at ask.
     capital = min(balance, params.max_capital_per_trade)
-    per_contract_open = (
-        entry_debit * 100
-        + 4 * params.commission_per_contract
-        + 0.5 * params.combo_slippage_per_share * 100
-    )
+    per_contract_open = entry_debit * 100 + 4 * params.commission_per_contract
     qty = int(floor(capital / per_contract_open))
     if qty < 1:
         base.exit_reason = "no_data"
@@ -227,7 +234,9 @@ def simulate_day(
     base.qty = qty
     base.entry_debit = entry_debit
 
-    # Walk minute-by-minute looking for exit.
+    # Walk minute-by-minute. P&L is measured on REALIZED exit credit (bid-side)
+    # vs paid entry debit (ask-side), so the spread is already baked into the
+    # target threshold — when we trigger, the bid is genuinely at +pt% of paid.
     time_stop_ts = pd.Timestamp(
         datetime.combine(day, params.time_stop)
     ).tz_localize("America/New_York")
@@ -235,19 +244,19 @@ def simulate_day(
     forward = [ts for ts in after_entry if ts <= time_stop_ts]
 
     exit_ts: pd.Timestamp | None = None
-    exit_debit: float | None = None
+    exit_credit: float | None = None
     exit_reason = "time_stop"
 
     for ts in forward:
-        mid = _spread_mid(leg_bars, ts)
-        if mid is None:
+        credit = _combo_price(leg_bars, ts, h, "exit")
+        if credit is None:
             continue
-        pnl_pct = (mid - entry_debit) / entry_debit
+        pnl_pct = (credit - entry_debit) / entry_debit
         if pnl_pct >= params.profit_target_pct:
-            exit_ts, exit_debit, exit_reason = ts, mid, "profit"
+            exit_ts, exit_credit, exit_reason = ts, credit, "profit"
             break
         if pnl_pct <= -params.stop_loss_pct:
-            exit_ts, exit_debit, exit_reason = ts, mid, "stop"
+            exit_ts, exit_credit, exit_reason = ts, credit, "stop"
             break
 
     if exit_ts is None:
@@ -257,17 +266,17 @@ def simulate_day(
             base.exit_reason = "no_data"
             return base
         exit_ts = candidate_idx[-1]
-        exit_debit = _spread_mid(leg_bars, exit_ts)
-        if exit_debit is None:
+        exit_credit = _combo_price(leg_bars, exit_ts, h, "exit")
+        if exit_credit is None:
             base.exit_reason = "no_data"
             return base
 
-    gross = (exit_debit - entry_debit) * 100 * qty
+    gross = (exit_credit - entry_debit) * 100 * qty
     fees = _round_trip_fees(qty, params)
     net = gross - fees
 
     base.exit_time = exit_ts.to_pydatetime()
-    base.exit_debit = exit_debit
+    base.exit_credit = exit_credit
     base.exit_reason = exit_reason
     base.gross_pnl = gross
     base.fees = fees
@@ -345,7 +354,7 @@ def run_sweep(
             stop_loss_pct=sl,
             strike_rule=sr,
             commission_per_contract=base.commission_per_contract,
-            combo_slippage_per_share=base.combo_slippage_per_share,
+            leg_half_spread=base.leg_half_spread,
             starting_balance=base.starting_balance,
             max_capital_per_trade=base.max_capital_per_trade,
         )

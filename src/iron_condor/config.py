@@ -58,11 +58,12 @@ class StrategyParams:
     # Default = $0.85/contract one-way, calibrated from user's real IBKR fills
     # ($27.14 round-trip for 16 contracts -> $0.85 per contract per side).
     commission_per_contract: float = 0.85
-    # Bid-ask spread cost paid per round trip on the 4-leg combo (one full
-    # spread crossed total: buy at ask on entry, sell at bid on exit).
-    # SPY 0DTE leg spreads are ~$0.01-0.02; the net combo spread with patient
-    # limit orders is similar. $0.02 is mid-conservative.
-    combo_slippage_per_share: float = 0.02
+    # Half of a single option leg's bid-ask spread. The simulator uses this to
+    # synthesize per-leg bid (mid - h) and ask (mid + h) from each minute's
+    # close. SPY 0DTE single legs are ~$0.01-0.02 wide; default half-spread
+    # 0.005 implies $0.01 leg spread, which sums to ~$0.04 round-trip on the
+    # 4-leg combo (worst-case independent fills; combo fills are often tighter).
+    leg_half_spread: float = 0.005
 
     # Account
     starting_balance: float = 1500.0
