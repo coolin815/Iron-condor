@@ -84,7 +84,9 @@ results/             # Backtest output (gitignored)
 ## Notes
 
 - Polygon Developer plan is assumed (unlimited historical + 1-min option aggs).
-- Option prices simulated at the **midpoint** of the 1-min OHLC. A configurable
-  per-contract slippage and a per-contract commission can be set in `config.py`.
+- Option prices simulated at the **midpoint** of the 1-min OHLC. Slippage is
+  applied at the combo net price (once per side), matching how 4-leg orders
+  fill in practice. Both `combo_slippage_per_share` and
+  `commission_per_contract` are configurable in `config.py`.
 - The backtest is intentionally pessimistic on missing data: if any leg is
   missing a bar at the entry minute, the day is skipped.

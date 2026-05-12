@@ -56,7 +56,11 @@ class StrategyParams:
 
     # Execution assumptions
     commission_per_contract: float = 0.65
-    slippage_per_contract: float = 0.05   # $/share per leg per side beyond mid
+    # Slippage is applied at the COMBO net price, once per side (open + close).
+    # 4-leg ICs are submitted as a single combo order at IBKR / Tastytrade /
+    # Schwab, so you cross the bid-ask once on the package, not four times.
+    # $0.05/share per side ≈ $10 round-trip friction on one IC.
+    combo_slippage_per_share: float = 0.05
 
     # Account
     starting_balance: float = 1500.0
