@@ -95,7 +95,18 @@ class PolygonClient:
         url = f"{BASE_URL}{path}"
         for attempt in range(MAX_RETRIES):
             self.throttle.wait()
-            resp = self.session.get(url, params=params, timeout=30)
+            try:
+                resp = self.session.get(url, params=params, timeout=30)
+            except (requests.exceptions.ReadTimeout,
+                    requests.exceptions.ConnectionError,
+                    requests.exceptions.ChunkedEncodingError) as e:
+                wait = min(60.0, 2.0 ** attempt)
+                log.warning(
+                    "Polygon %s -> network error (%s); sleeping %.0fs (attempt %d/%d)",
+                    path, type(e).__name__, wait, attempt + 1, MAX_RETRIES,
+                )
+                _time.sleep(wait)
+                continue
             if resp.status_code == 200:
                 return resp.json()
             if resp.status_code == 429:
