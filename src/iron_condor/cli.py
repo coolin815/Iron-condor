@@ -2,22 +2,38 @@
 
 Examples:
 
+    # Smoke test on most recent trading day
     python -m iron_condor.cli --smoke
-    python -m iron_condor.cli --days 365
-    python -m iron_condor.cli --start 2024-05-13 --end 2025-05-12
+
+    # Full 840-config sweep
+    python -m iron_condor.cli --days 30 --sweep
+
+    # Targeted sweep: just the winning family from prior runs
+    python -m iron_condor.cli --days 30 --sweep --strike fixed_1.0x3 --rsi 14
+
+    # Single specific config
+    python -m iron_condor.cli --days 30 --sweep \\
+        --strike fixed_1.0x3 --rsi 14 --pt 0.20 --sl 0.50 --co 12:30
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import sys
-from datetime import date, timedelta
+from datetime import date, time, timedelta
 from pathlib import Path
 
 import pandas as pd
 
 from .backtest import run_backtest, run_sweep, simulate_day
-from .config import StrategyParams
+from .config import (
+    ENTRY_CUTOFFS,
+    PROFIT_TARGETS,
+    RSI_PERIODS,
+    STOP_LOSSES,
+    STRIKE_RULES,
+    StrategyParams,
+)
 from .metrics import summarize_run, summarize_sweep
 from .polygon_client import PolygonClient
 
@@ -36,14 +52,32 @@ def _parse_date(s: str) -> date:
     return date.fromisoformat(s)
 
 
+def _parse_time(s: str) -> time:
+    """Parse HH:MM (24-hour, ET)."""
+    return time.fromisoformat(s)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="SPY 0DTE long iron condor backtester")
     p.add_argument("--smoke", action="store_true", help="Run a single recent day to verify wiring")
     p.add_argument("--days", type=int, default=365, help="Lookback window in calendar days (default 365)")
     p.add_argument("--start", type=_parse_date, help="Explicit start date YYYY-MM-DD")
     p.add_argument("--end", type=_parse_date, help="Explicit end date YYYY-MM-DD")
-    p.add_argument("--sweep", action="store_true", help="Run the full parameter sweep (default: single config)")
+    p.add_argument("--sweep", action="store_true", help="Run a parameter sweep (default: single config)")
     p.add_argument("--verbose", "-v", action="store_true")
+
+    # Sweep dimension filters. Repeat the flag to include multiple values.
+    p.add_argument("--rsi", type=int, action="append",
+                   help="Restrict sweep to these RSI periods (default: 9, 14). Repeatable.")
+    p.add_argument("--strike", action="append",
+                   help="Restrict to these strike-rule names. e.g. fixed_1.0x3. Repeatable.")
+    p.add_argument("--pt", type=float, action="append",
+                   help="Restrict to these profit targets (e.g. 0.20). Repeatable.")
+    p.add_argument("--sl", type=float, action="append",
+                   help="Restrict to these stop losses (e.g. 0.50). Repeatable.")
+    p.add_argument("--co", type=_parse_time, action="append",
+                   help="Restrict to these entry cutoffs HH:MM ET (e.g. 12:30). Repeatable.")
+
     args = p.parse_args(argv)
     _setup_logging(args.verbose)
 
@@ -51,7 +85,6 @@ def main(argv: list[str] | None = None) -> int:
     client = PolygonClient()
 
     if args.smoke:
-        # Use yesterday (or last trading day) to validate the pipeline end-to-end.
         from .backtest import _trading_days
         end = date.today() - timedelta(days=1)
         start = end - timedelta(days=10)
@@ -75,7 +108,40 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Backtest window: {start} -> {end}")
 
     if args.sweep:
-        sweep_df = run_sweep(start, end, client=client)
+        # Apply filters; missing flag means "use all defaults".
+        rsi_periods = args.rsi or list(RSI_PERIODS)
+        profit_targets = args.pt or list(PROFIT_TARGETS)
+        stop_losses = args.sl or list(STOP_LOSSES)
+        entry_cutoffs = args.co or list(ENTRY_CUTOFFS)
+        if args.strike:
+            wanted = set(args.strike)
+            strike_rules = [r for r in STRIKE_RULES if r.name in wanted]
+            missing = wanted - {r.name for r in strike_rules}
+            if missing:
+                print(f"WARN: unknown strike rule(s) ignored: {missing}", file=sys.stderr)
+        else:
+            strike_rules = list(STRIKE_RULES)
+
+        n = (
+            len(rsi_periods) * len(strike_rules) * len(profit_targets)
+            * len(stop_losses) * len(entry_cutoffs)
+        )
+        print(
+            f"Sweep: {n} configs "
+            f"(rsi={rsi_periods}, strikes={[r.name for r in strike_rules]}, "
+            f"pt={profit_targets}, sl={stop_losses}, "
+            f"co={[c.isoformat(timespec='minutes') for c in entry_cutoffs]})"
+        )
+
+        sweep_df = run_sweep(
+            start, end,
+            rsi_periods=rsi_periods,
+            strike_rules=strike_rules,
+            profit_targets=profit_targets,
+            stop_losses=stop_losses,
+            entry_cutoffs=entry_cutoffs,
+            client=client,
+        )
         sweep_df.to_csv(RESULTS_DIR / "sweep_trades.csv", index=False)
         summary = summarize_sweep(sweep_df, StrategyParams().starting_balance)
         summary.to_csv(RESULTS_DIR / "sweep_summary.csv", index=False)
