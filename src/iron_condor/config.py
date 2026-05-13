@@ -1,6 +1,6 @@
-"""Strategy parameters and sweep grids.
+"""Strategy parameters and sweep grids for the SPY 0DTE ORB strategy.
 
-All times are NY-market local (US/Eastern). Convert from PT by adding 3h.
+All times are NY-market local (US/Eastern).
 """
 from __future__ import annotations
 
@@ -8,6 +8,19 @@ from dataclasses import dataclass, field
 from datetime import time
 from typing import Literal
 
+UNDERLYING: str = "SPY"
+RISK_FREE_RATE: float = 0.045  # kept for any greek calcs we add later
+
+# ---------------------------------------------------------------------------
+# Confluence levels
+# ---------------------------------------------------------------------------
+
+ConfluenceLevel = Literal["none", "pdh_pdl", "pmh_pml", "onh_onl", "any"]
+# "none"    = take any ORH/ORL break
+# "pdh_pdl" = long break must also clear PDH; short break must also clear PDL
+# "pmh_pml" = same with premarket high/low
+# "onh_onl" = same with overnight high/low (post yesterday's close, pre today's open)
+# "any"     = clear any of PDH/PMH/ONH on long side (or PDL/PML/ONL on short)
 
 # ---------------------------------------------------------------------------
 # Single-run strategy parameters
@@ -15,55 +28,22 @@ from typing import Literal
 
 
 @dataclass(frozen=True)
-class StrikeRule:
-    """How to pick the four iron-condor strikes at entry.
-
-    `mode="fixed"` uses dollar offsets from the signal-bar SPY price:
-      - long_inner_offset:  distance from spot to the long inner strikes
-      - wing_width:         distance between long inner and short wing
-    `mode="delta"` picks strikes whose Black-Scholes delta is closest to the
-    target on each side.
-    """
-
-    mode: Literal["fixed", "delta"]
-    name: str
-    long_inner_offset: float | None = None  # used when mode="fixed"
-    wing_width: float | None = None         # used when mode="fixed"
-    inner_delta: float | None = None        # used when mode="delta", e.g. 0.25
-    outer_delta: float | None = None        # used when mode="delta", e.g. 0.10
-
-
-@dataclass(frozen=True)
 class StrategyParams:
-    rsi_period: int = 14
-    rsi_upper: float = 70.0
-    rsi_lower: float = 30.0
+    # Signal
+    or_window_min: int = 15                # opening range length in minutes
+    confluence: ConfluenceLevel = "none"
+    earliest_entry: time = time(9, 45)     # don't trade in the OR window itself
+    latest_entry: time = time(11, 0)       # 8:00 AM PT — no new trades after this
+    time_stop_min: int = 30                # max minutes to hold a position
+    hard_close: time = time(15, 55)        # safety net before 4 PM ET
 
-    # Entry window, NY time
-    earliest_entry: time = time(9, 50)   # 6:50 AM PT
-    latest_entry: time = time(14, 0)     # 11:00 AM PT
-    time_stop: time = time(14, 30)       # 11:30 AM PT
-    hard_close: time = time(15, 55)      # safety net before 4 PM ET
+    # Net-of-fees exits
+    profit_target_pct: float = 0.05        # +5% on capital deployed (after fees)
+    stop_loss_pct: float = 0.10            # -10% on capital deployed
 
-    profit_target_pct: float = 0.25      # 25% of debit paid
-    stop_loss_pct: float = 0.35          # lose 35% of debit -> exit
-
-    strike_rule: StrikeRule = field(
-        default_factory=lambda: StrikeRule(
-            mode="fixed", name="fixed_1.5x4", long_inner_offset=1.5, wing_width=4.0
-        )
-    )
-
-    # Execution assumptions
-    # Default = $0.85/contract one-way, calibrated from user's real IBKR fills
-    # ($27.14 round-trip for 16 contracts -> $0.85 per contract per side).
+    # Execution
     commission_per_contract: float = 0.85
-    # Half of a single option leg's bid-ask spread. The simulator uses this to
-    # synthesize per-leg bid (mid - h) and ask (mid + h) from each minute's
-    # close. SPY 0DTE single legs are ~$0.01-0.02 wide; default half-spread
-    # 0.005 implies $0.01 leg spread, which sums to ~$0.04 round-trip on the
-    # 4-leg combo (worst-case independent fills; combo fills are often tighter).
-    leg_half_spread: float = 0.005
+    leg_half_spread: float = 0.005         # half of single-leg bid-ask
 
     # Account
     starting_balance: float = 1500.0
@@ -71,55 +51,23 @@ class StrategyParams:
 
 
 # ---------------------------------------------------------------------------
-# Sweep grid (used by backtest.run_sweep)
+# Sweep grids
 # ---------------------------------------------------------------------------
 
+OR_WINDOWS: tuple[int, ...] = (5, 15, 30)
 
-RSI_PERIODS: tuple[int, ...] = (14,)  # 30-day sweep showed RSI 9 lost every config
+CONFLUENCE_LEVELS: tuple[ConfluenceLevel, ...] = ("none", "any")
 
-# Pairs of (overbought, oversold) thresholds to sweep.
-RSI_THRESHOLDS: tuple[tuple[float, float], ...] = (
-    (70.0, 30.0),   # default — most signals (fires ~95% of days)
-    (73.0, 27.0),   # slightly tighter
-    (75.0, 25.0),   # tighter
-    (80.0, 20.0),   # only strong extremes
-)
+PROFIT_TARGETS: tuple[float, ...] = (0.03, 0.05, 0.07, 0.10)
 
-PROFIT_TARGETS: tuple[float, ...] = (0.10, 0.15, 0.20, 0.25, 0.30)
+STOP_LOSSES: tuple[float, ...] = (0.05, 0.10, 0.15)
 
-STOP_LOSSES: tuple[float, ...] = (0.25, 0.35, 0.50)
+TIME_STOPS: tuple[int, ...] = (15, 30, 60)
 
-# Entry-window cutoffs in NY (ET) time. PT in parens for sanity:
-#   12:30 ET = 9:30 PT,  13:00 ET = 10:00 PT,
-#   13:30 ET = 10:30 PT, 14:00 ET = 11:00 PT
+# Entry cutoffs in NY (ET) time. PT in parens:
+#   10:30 ET = 7:30 PT, 11:00 ET = 8:00 PT, 11:30 ET = 8:30 PT
 ENTRY_CUTOFFS: tuple[time, ...] = (
-    time(12, 30),
-    time(13, 0),
-    time(13, 30),
-    time(14, 0),
+    time(10, 30),
+    time(11, 0),
+    time(11, 30),
 )
-
-# Full catalog of every strike rule we have — used for CLI lookup by name.
-ALL_STRIKE_RULES: tuple[StrikeRule, ...] = (
-    # Fixed offsets from the brief.
-    StrikeRule(mode="fixed", name="fixed_1.0x3", long_inner_offset=1.0, wing_width=3.0),
-    StrikeRule(mode="fixed", name="fixed_1.5x3", long_inner_offset=1.5, wing_width=3.0),
-    StrikeRule(mode="fixed", name="fixed_1.5x4", long_inner_offset=1.5, wing_width=4.0),
-    StrikeRule(mode="fixed", name="fixed_2.0x4", long_inner_offset=2.0, wing_width=4.0),
-    StrikeRule(mode="fixed", name="fixed_2.0x5", long_inner_offset=2.0, wing_width=5.0),
-    # Delta-targeted (volatility-aware).
-    StrikeRule(mode="delta", name="delta_25_10", inner_delta=0.25, outer_delta=0.10),
-    StrikeRule(mode="delta", name="delta_30_15", inner_delta=0.30, outer_delta=0.15),
-)
-
-# Default sweep — narrowed to the family that won every 30-day sweep so far.
-# Override via --strike on the CLI to broaden.
-STRIKE_RULES: tuple[StrikeRule, ...] = (ALL_STRIKE_RULES[0],)
-
-
-# ---------------------------------------------------------------------------
-# Misc
-# ---------------------------------------------------------------------------
-
-RISK_FREE_RATE: float = 0.045  # 4.5% — close enough for 0DTE delta math
-UNDERLYING: str = "SPY"
