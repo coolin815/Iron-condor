@@ -1,39 +1,39 @@
-"""SPY 0DTE breakout + reversal strategy.
+"""SPY 0DTE candle-pattern strategy.
 
-Single trade per day. Two scans run in parallel; whichever fires first wins.
-No trades on Fridays.
+Scans 10 candle patterns on 5-min bars. Whichever fires first inside the
+entry window, with all four indicators confirming, wins. One trade/day.
 
-Indicators:
-- VWAP: cumulative volume-weighted typical price from 9:30 ET (resets daily)
-- EMA9 / EMA21: cross-day exponential moving averages on 1-min closes
-- 5-min cross-day RSI(14): RSI on 5-min closes, continuous across days
-- 5-min intraday RSI(14): RSI on 5-min closes, resets at 9:30 each day
-  (needs ~70 min of warmup before it has a value)
+Patterns (10 total, all 3 candles):
+  Bullish (call):
+    1. three_white_soldiers — 3 consecutive higher-closing bullish candles
+    2. morning_star — big bear, small body, big bull closing past c1 midpoint
+    3. bullish_engulfing — bear, bullish engulfing, bullish continuation
+    4. hammer — bear, hammer (long lower wick), bullish continuation
+    5. piercing — bear, bullish closing past 50% of c1 body, continuation
+  Bearish (put):
+    6. three_black_crows
+    7. evening_star
+    8. bearish_engulfing
+    9. shooting_star
+    10. dark_cloud_cover
 
-Breakout signal:
-- 2 consecutive 1-min closes outside the opening range (above ORH = call,
-  below ORL = put)
-- Filter: price aligned with VWAP, EMA9, EMA21 (above for call, below for put)
-- Filter: cross-day RSI > 50 (call) or < 50 (put)
-- Skip if cross-day RSI was > 70 or < 30 at the previous 5-min bar
+Confirmation required on the detection bar's close (all four):
+  Calls:  close > VWAP  AND  EMA9 > EMA21  AND  close > EMA9  AND  RSI > 50
+  Puts:   close < VWAP  AND  EMA9 < EMA21  AND  close < EMA9  AND  RSI < 50
 
-Reversal signal:
-- A 1-min candle closes outside the OR, the NEXT 1-min candle closes back inside
-- Direction determined by current VWAP/EMA9 alignment (above = call, below = put)
-- Filter: VWAP + EMA9 aligned (no EMA21)
-- Filter: BOTH cross-day RSI and intraday RSI > 50 (call) or < 50 (put)
-- Skip call reversals if cross-day RSI in [60, 65] (puts have no skip zone)
+Indicators are all computed on the 5-min bar series, cross-day (EMA, RSI),
+so opening bars already have a warmed-up value.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time
 from typing import Literal
 
 import numpy as np
 import pandas as pd
 
-from .config import StrategyParams
+from .config import PATTERN_NAMES, StrategyParams
 from .polygon_client import build_option_ticker
 
 
@@ -43,28 +43,19 @@ from .polygon_client import build_option_ticker
 
 
 @dataclass(frozen=True)
-class Levels:
-    orh: float | None = None
-    orl: float | None = None
-
-
-@dataclass(frozen=True)
 class Signal:
-    timestamp: pd.Timestamp
-    signal_type: Literal["breakout", "reversal"]
+    timestamp: pd.Timestamp          # close of the 3rd (most recent) detection bar
+    pattern: str
     direction: Literal["call", "put"]
     spot: float
-    orh: float
-    orl: float
     vwap: float
     ema9: float
     ema21: float
-    rsi_cross_day: float
-    rsi_intraday: float | None
+    rsi: float
 
 
 # ---------------------------------------------------------------------------
-# Time-window helpers
+# Time helpers
 # ---------------------------------------------------------------------------
 
 
@@ -85,32 +76,12 @@ def _to_et(bars: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Opening range
-# ---------------------------------------------------------------------------
-
-
-def opening_range(today_bars: pd.DataFrame, or_window_min: int) -> Levels:
-    """High and low of TOUCHED prices in the first `or_window_min` minutes."""
-    if today_bars.empty:
-        return Levels()
-    end_dt = datetime.combine(date.today(), time(9, 30)) + timedelta(minutes=or_window_min)
-    or_bars = _between_time(today_bars, time(9, 30), end_dt.time())
-    if or_bars.empty:
-        return Levels()
-    return Levels(
-        orh=float(or_bars["high"].max()),
-        orl=float(or_bars["low"].min()),
-    )
-
-
-# ---------------------------------------------------------------------------
 # Indicators
 # ---------------------------------------------------------------------------
 
 
-def session_vwap(today_bars: pd.DataFrame) -> pd.Series:
-    """Cumulative VWAP across the regular session, indexed by minute."""
-    reg = _to_et(_between_time(today_bars, time(9, 30), time(16, 0)))
+def session_vwap(bars_1min: pd.DataFrame) -> pd.Series:
+    reg = _to_et(_between_time(bars_1min, time(9, 30), time(16, 0)))
     if reg.empty:
         return pd.Series(dtype=float)
     typ = (reg["high"] + reg["low"] + reg["close"]) / 3.0
@@ -121,12 +92,10 @@ def session_vwap(today_bars: pd.DataFrame) -> pd.Series:
 
 
 def ema(series: pd.Series, period: int) -> pd.Series:
-    """Standard EMA with adjust=False so it starts from the first value."""
     return series.ewm(span=period, adjust=False).mean()
 
 
 def _wilder_rsi(closes: pd.Series, period: int = 14) -> pd.Series:
-    """Wilder RSI on a closes series; uses simple-average seed then EWM alpha=1/period."""
     delta = closes.diff()
     gain = delta.clip(lower=0.0)
     loss = (-delta).clip(lower=0.0)
@@ -141,7 +110,7 @@ def _wilder_rsi(closes: pd.Series, period: int = 14) -> pd.Series:
 
 
 def aggregate_to_5min(bars_1min: pd.DataFrame) -> pd.DataFrame:
-    """Resample 1-min OHLCV to 5-min, regular session only, ET-indexed."""
+    """1-min OHLCV -> 5-min OHLCV, regular session only, ET-indexed."""
     reg = _to_et(_between_time(bars_1min, time(9, 30), time(16, 0)))
     if reg.empty:
         return reg
@@ -151,47 +120,232 @@ def aggregate_to_5min(bars_1min: pd.DataFrame) -> pd.DataFrame:
     return agg
 
 
-def cross_day_5min_rsi(
-    today_1min: pd.DataFrame, yesterday_1min: pd.DataFrame, period: int = 14
-) -> pd.Series:
-    """RSI(14) on 5-min closes spanning yesterday + today. Indexed by 5-min ET bar start."""
-    today_5 = aggregate_to_5min(today_1min)
-    yest_5 = aggregate_to_5min(yesterday_1min)
-    if today_5.empty:
-        return pd.Series(dtype=float)
-    if yest_5.empty:
-        combined = today_5
-    else:
-        combined = pd.concat([yest_5, today_5])
-    return _wilder_rsi(combined["close"], period=period)
+# ---------------------------------------------------------------------------
+# Candle pattern detectors
+# Each takes 3 consecutive 5-min bars (c1 oldest, c3 most recent) and returns
+# True if the pattern is present. Body-size thresholds are relative to the
+# candle's total range so they scale with intraday volatility.
+# ---------------------------------------------------------------------------
 
 
-def intraday_5min_rsi(today_1min: pd.DataFrame, period: int = 14) -> pd.Series:
-    """RSI(14) on today's 5-min closes only (resets daily)."""
-    today_5 = aggregate_to_5min(today_1min)
-    if today_5.empty:
-        return pd.Series(dtype=float)
-    return _wilder_rsi(today_5["close"], period=period)
+def _body(c) -> float:
+    return abs(float(c["close"]) - float(c["open"]))
 
 
-def _value_at(series: pd.Series, ts: pd.Timestamp) -> float | None:
-    """Most recent value in `series` at-or-before `ts`. None if no value."""
-    if series.empty:
-        return None
-    sub = series[series.index <= ts]
-    if sub.empty or pd.isna(sub.iloc[-1]):
-        return None
-    return float(sub.iloc[-1])
+def _is_bullish(c) -> bool:
+    return float(c["close"]) > float(c["open"])
 
 
-def _previous_5min_rsi_value(rsi_5min: pd.Series, ts: pd.Timestamp) -> float | None:
-    """The 5-min RSI value at the BAR BEFORE the bar containing `ts`."""
-    if rsi_5min.empty:
-        return None
-    sub = rsi_5min[rsi_5min.index < ts.floor("5min")]
-    if sub.empty or pd.isna(sub.iloc[-1]):
-        return None
-    return float(sub.iloc[-1])
+def _is_bearish(c) -> bool:
+    return float(c["close"]) < float(c["open"])
+
+
+def _upper_wick(c) -> float:
+    return float(c["high"]) - max(float(c["close"]), float(c["open"]))
+
+
+def _lower_wick(c) -> float:
+    return min(float(c["close"]), float(c["open"])) - float(c["low"])
+
+
+def _total_range(c) -> float:
+    return float(c["high"]) - float(c["low"])
+
+
+# 1. Three White Soldiers
+def is_three_white_soldiers(c1, c2, c3) -> bool:
+    return (
+        _is_bullish(c1) and _is_bullish(c2) and _is_bullish(c3)
+        and float(c2["close"]) > float(c1["close"])
+        and float(c3["close"]) > float(c2["close"])
+        # each candle has a meaningful body
+        and _body(c1) > 0.5 * _total_range(c1)
+        and _body(c2) > 0.5 * _total_range(c2)
+        and _body(c3) > 0.5 * _total_range(c3)
+    )
+
+
+# 2. Three Black Crows
+def is_three_black_crows(c1, c2, c3) -> bool:
+    return (
+        _is_bearish(c1) and _is_bearish(c2) and _is_bearish(c3)
+        and float(c2["close"]) < float(c1["close"])
+        and float(c3["close"]) < float(c2["close"])
+        and _body(c1) > 0.5 * _total_range(c1)
+        and _body(c2) > 0.5 * _total_range(c2)
+        and _body(c3) > 0.5 * _total_range(c3)
+    )
+
+
+# 3. Morning Star (bull reversal)
+def is_morning_star(c1, c2, c3) -> bool:
+    c1_body = _body(c1)
+    if c1_body == 0:
+        return False
+    midpoint = (float(c1["open"]) + float(c1["close"])) / 2.0
+    return (
+        _is_bearish(c1)
+        and c1_body > 0.5 * _total_range(c1)
+        and _body(c2) < 0.5 * c1_body       # small middle candle
+        and _is_bullish(c3)
+        and _body(c3) > 0.5 * _total_range(c3)
+        and float(c3["close"]) > midpoint   # closes back past c1 midpoint
+    )
+
+
+# 4. Evening Star (bear reversal)
+def is_evening_star(c1, c2, c3) -> bool:
+    c1_body = _body(c1)
+    if c1_body == 0:
+        return False
+    midpoint = (float(c1["open"]) + float(c1["close"])) / 2.0
+    return (
+        _is_bullish(c1)
+        and c1_body > 0.5 * _total_range(c1)
+        and _body(c2) < 0.5 * c1_body
+        and _is_bearish(c3)
+        and _body(c3) > 0.5 * _total_range(c3)
+        and float(c3["close"]) < midpoint
+    )
+
+
+# 5. Bullish Engulfing + confirmation
+def is_bullish_engulfing(c1, c2, c3) -> bool:
+    return (
+        _is_bearish(c1)
+        and _is_bullish(c2)
+        and float(c2["open"]) <= float(c1["close"])
+        and float(c2["close"]) >= float(c1["open"])
+        and _body(c2) > _body(c1)
+        and _is_bullish(c3)
+        and float(c3["close"]) > float(c2["close"])
+    )
+
+
+# 6. Bearish Engulfing + confirmation
+def is_bearish_engulfing(c1, c2, c3) -> bool:
+    return (
+        _is_bullish(c1)
+        and _is_bearish(c2)
+        and float(c2["open"]) >= float(c1["close"])
+        and float(c2["close"]) <= float(c1["open"])
+        and _body(c2) > _body(c1)
+        and _is_bearish(c3)
+        and float(c3["close"]) < float(c2["close"])
+    )
+
+
+# 7. Hammer + confirmation (bull reversal)
+def is_hammer(c1, c2, c3) -> bool:
+    c2_body = _body(c2)
+    c2_range = _total_range(c2)
+    if c2_body == 0 or c2_range == 0:
+        return False
+    return (
+        _is_bearish(c1)
+        and _body(c1) > 0.5 * _total_range(c1)
+        and _lower_wick(c2) >= 2.0 * c2_body
+        and _upper_wick(c2) <= 0.15 * c2_range
+        and c2_body <= 0.35 * c2_range
+        and _is_bullish(c3)
+        and float(c3["close"]) > float(c2["close"])
+    )
+
+
+# 8. Shooting Star + confirmation (bear reversal)
+def is_shooting_star(c1, c2, c3) -> bool:
+    c2_body = _body(c2)
+    c2_range = _total_range(c2)
+    if c2_body == 0 or c2_range == 0:
+        return False
+    return (
+        _is_bullish(c1)
+        and _body(c1) > 0.5 * _total_range(c1)
+        and _upper_wick(c2) >= 2.0 * c2_body
+        and _lower_wick(c2) <= 0.15 * c2_range
+        and c2_body <= 0.35 * c2_range
+        and _is_bearish(c3)
+        and float(c3["close"]) < float(c2["close"])
+    )
+
+
+# 9. Piercing pattern + confirmation (bull reversal)
+def is_piercing(c1, c2, c3) -> bool:
+    c1_body = _body(c1)
+    if c1_body == 0:
+        return False
+    midpoint = (float(c1["open"]) + float(c1["close"])) / 2.0
+    return (
+        _is_bearish(c1)
+        and c1_body > 0.5 * _total_range(c1)
+        and _is_bullish(c2)
+        and float(c2["open"]) < float(c1["close"])     # opens below c1 close
+        and float(c2["close"]) > midpoint               # closes past midpoint
+        and float(c2["close"]) < float(c1["open"])     # but below c1 open (not engulfing)
+        and _is_bullish(c3)
+        and float(c3["close"]) > float(c2["close"])
+    )
+
+
+# 10. Dark Cloud Cover + confirmation (bear reversal)
+def is_dark_cloud(c1, c2, c3) -> bool:
+    c1_body = _body(c1)
+    if c1_body == 0:
+        return False
+    midpoint = (float(c1["open"]) + float(c1["close"])) / 2.0
+    return (
+        _is_bullish(c1)
+        and c1_body > 0.5 * _total_range(c1)
+        and _is_bearish(c2)
+        and float(c2["open"]) > float(c1["close"])
+        and float(c2["close"]) < midpoint
+        and float(c2["close"]) > float(c1["open"])
+        and _is_bearish(c3)
+        and float(c3["close"]) < float(c2["close"])
+    )
+
+
+PATTERN_DETECTORS = (
+    ("three_white_soldiers", is_three_white_soldiers, "call"),
+    ("three_black_crows",    is_three_black_crows,    "put"),
+    ("morning_star",         is_morning_star,         "call"),
+    ("evening_star",         is_evening_star,         "put"),
+    ("bullish_engulfing",    is_bullish_engulfing,    "call"),
+    ("bearish_engulfing",    is_bearish_engulfing,    "put"),
+    ("hammer",               is_hammer,               "call"),
+    ("shooting_star",        is_shooting_star,        "put"),
+    ("piercing",             is_piercing,             "call"),
+    ("dark_cloud",           is_dark_cloud,           "put"),
+)
+
+
+def detect_first_pattern(c1, c2, c3):
+    """Run all 10 detectors; return (name, direction) for the first match, else None."""
+    for name, detector, direction in PATTERN_DETECTORS:
+        if detector(c1, c2, c3):
+            return name, direction
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Confirmation
+# ---------------------------------------------------------------------------
+
+
+def _confirm(direction: str, close: float, vwap: float, ema9: float, ema21: float, rsi: float, params) -> bool:
+    if direction == "call":
+        return (
+            close > vwap
+            and ema9 > ema21
+            and close > ema9
+            and rsi > params.rsi_long_thresh
+        )
+    return (
+        close < vwap
+        and ema9 < ema21
+        and close < ema9
+        and rsi < params.rsi_short_thresh
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -203,26 +357,22 @@ def _is_friday(day: date) -> bool:
     return day.weekday() == 4
 
 
+def _vwap_at(vwap: pd.Series, ts: pd.Timestamp) -> float | None:
+    """VWAP value at-or-before `ts`."""
+    if vwap.empty:
+        return None
+    sub = vwap[vwap.index <= ts]
+    if sub.empty or pd.isna(sub.iloc[-1]):
+        return None
+    return float(sub.iloc[-1])
+
+
 def find_signal(
     today_1min: pd.DataFrame,
     yesterday_1min: pd.DataFrame,
     params: StrategyParams,
 ) -> Signal | None:
-    """Find the first breakout or reversal signal in the entry window.
-
-    Two-stage logic. The candle PATTERN opens a 'scanning state' that
-    persists across subsequent bars; on each bar in the scanning state, the
-    bot tries to enter when the INDICATORS align.
-
-    Breakout scanning state: count of consecutive closes outside OR (above
-    or below) is >= 2. A close back inside OR resets the count to 0 (which
-    exits the scanning state).
-
-    Reversal scanning state: triggered when a bar closes inside OR after
-    the previous bar closed outside. Persists across subsequent inside
-    closes. Cancelled when price closes back outside OR (a new breakout
-    attempt invalidates the prior reversal pattern).
-    """
+    """First pattern-with-confirmation match inside the entry window."""
     if today_1min.empty:
         return None
     if params.skip_fridays:
@@ -230,183 +380,65 @@ def find_signal(
         if _is_friday(day):
             return None
 
-    levels = opening_range(today_1min, params.or_window_min)
-    if levels.orh is None or levels.orl is None:
+    # Aggregate to 5-min bars, cross-day for EMA + RSI warmup
+    today_5 = aggregate_to_5min(today_1min)
+    if today_5.empty:
         return None
+    yest_5 = aggregate_to_5min(yesterday_1min) if not yesterday_1min.empty else pd.DataFrame()
+    combined_close = pd.concat([yest_5["close"], today_5["close"]]) if not yest_5.empty else today_5["close"]
+    ema9 = ema(combined_close, 9).loc[today_5.index]
+    ema21 = ema(combined_close, 21).loc[today_5.index]
+    rsi = _wilder_rsi(combined_close, period=14).loc[today_5.index]
 
-    today_et = _to_et(today_1min)
-    reg = _between_time(today_et, time(9, 30), time(16, 0))
-    if reg.empty:
-        return None
-
+    # VWAP from 1-min data (intraday cumulative)
     vwap = session_vwap(today_1min)
-    # Cross-day EMAs: warm up from yesterday's regular session, continue today
-    yest_reg = _between_time(_to_et(yesterday_1min), time(9, 30), time(16, 0))
-    if yest_reg.empty:
-        ema9 = ema(reg["close"], 9)
-        ema21 = ema(reg["close"], 21)
-    else:
-        combined = pd.concat([yest_reg["close"], reg["close"]])
-        ema9 = ema(combined, 9).loc[reg.index]
-        ema21 = ema(combined, 21).loc[reg.index]
-    rsi_xd = cross_day_5min_rsi(today_1min, yesterday_1min)
-    rsi_intra = intraday_5min_rsi(today_1min)
 
-    # Use the latest of the two cutoffs to bound the walk; per-signal cutoffs
-    # are applied below per bar.
-    latest_overall = max(params.breakout_latest_entry, params.reversal_latest_entry)
-    bars = reg[(reg.index.time >= params.earliest_entry) & (reg.index.time <= latest_overall)]
-    if bars.empty:
+    # Walk 5-min bars and look for patterns
+    bars = today_5.copy()
+    timestamps = list(bars.index)
+    if len(timestamps) < 3:
         return None
 
-    try_breakout = params.signal_mode in ("both", "breakout")
-    try_reversal = params.signal_mode in ("both", "reversal")
-
-    # Scanning state
-    consec_above_orh = 0
-    consec_below_orl = 0
-    reversal_call_scan = False     # came back inside from below (dip and recover)
-    reversal_put_scan = False      # came back inside from above (spike and fade)
-
-    for ts, row in bars.iterrows():
-        cur_close = float(row["close"])
-
-        prev_above_count = consec_above_orh
-        prev_below_count = consec_below_orl
-
-        if cur_close > levels.orh:
-            consec_above_orh += 1
-            consec_below_orl = 0
-            # Closing outside cancels any reversal scan in progress
-            reversal_call_scan = False
-            reversal_put_scan = False
-        elif cur_close < levels.orl:
-            consec_below_orl += 1
-            consec_above_orh = 0
-            reversal_call_scan = False
-            reversal_put_scan = False
-        else:
-            # Closed back inside OR — count resets
-            consec_above_orh = 0
-            consec_below_orl = 0
-            # New reversal scans are triggered when prior bar was outside
-            if prev_below_count >= 1:
-                reversal_call_scan = True
-                reversal_put_scan = False
-            elif prev_above_count >= 1:
-                reversal_put_scan = True
-                reversal_call_scan = False
-            # else: simply still inside — keep any prior reversal scan alive
-
-        # Apply per-signal-type cutoffs at this bar
+    for i in range(2, len(timestamps)):
+        ts = timestamps[i]
         ts_time = ts.time()
-        breakout_open = ts_time <= params.breakout_latest_entry
-        reversal_open = ts_time <= params.reversal_latest_entry
+        if ts_time < params.earliest_entry:
+            continue
+        if ts_time > params.latest_entry:
+            break
 
-        # First-to-fire: check breakout(s) first, then reversal(s)
-        if try_breakout and breakout_open:
-            if consec_above_orh >= 2:
-                sig = _check_breakout_indicators(
-                    "call", cur_close, ts, levels,
-                    vwap, ema9, ema21, rsi_xd, params,
-                )
-                if sig is not None:
-                    return sig
-            elif consec_below_orl >= 2:
-                sig = _check_breakout_indicators(
-                    "put", cur_close, ts, levels,
-                    vwap, ema9, ema21, rsi_xd, params,
-                )
-                if sig is not None:
-                    return sig
+        c1 = bars.iloc[i - 2]
+        c2 = bars.iloc[i - 1]
+        c3 = bars.iloc[i]
+        match = detect_first_pattern(c1, c2, c3)
+        if match is None:
+            continue
+        pattern_name, direction = match
 
-        if try_reversal and reversal_open:
-            if reversal_call_scan:
-                sig = _check_reversal_indicators(
-                    "call", cur_close, ts, levels,
-                    vwap, ema9, rsi_xd, rsi_intra, params,
-                )
-                if sig is not None:
-                    return sig
-            elif reversal_put_scan:
-                sig = _check_reversal_indicators(
-                    "put", cur_close, ts, levels,
-                    vwap, ema9, rsi_xd, rsi_intra, params,
-                )
-                if sig is not None:
-                    return sig
+        # Confirmations on this bar's close
+        close = float(c3["close"])
+        vwap_now = _vwap_at(vwap, ts)
+        ema9_now = float(ema9.loc[ts]) if ts in ema9.index and pd.notna(ema9.loc[ts]) else None
+        ema21_now = float(ema21.loc[ts]) if ts in ema21.index and pd.notna(ema21.loc[ts]) else None
+        rsi_now = float(rsi.loc[ts]) if ts in rsi.index and pd.notna(rsi.loc[ts]) else None
+
+        if None in (vwap_now, ema9_now, ema21_now, rsi_now):
+            continue
+        if not _confirm(direction, close, vwap_now, ema9_now, ema21_now, rsi_now, params):
+            continue
+
+        return Signal(
+            timestamp=ts,
+            pattern=pattern_name,
+            direction=direction,
+            spot=close,
+            vwap=vwap_now,
+            ema9=ema9_now,
+            ema21=ema21_now,
+            rsi=rsi_now,
+        )
 
     return None
-
-
-def _check_breakout_indicators(
-    direction: str, cur_close: float, ts, levels,
-    vwap, ema9, ema21, rsi_xd, params,
-) -> Signal | None:
-    """Indicator alignment check for a breakout-direction scan."""
-    vwap_now = _value_at(vwap, ts)
-    ema9_now = _value_at(ema9, ts)
-    ema21_now = _value_at(ema21, ts)
-    rsi_now = _value_at(rsi_xd, ts)
-    rsi_prev = _previous_5min_rsi_value(rsi_xd, ts)
-    if None in (vwap_now, ema9_now, ema21_now, rsi_now):
-        return None
-    # Skip if the prior 5-min RSI bar was extreme
-    if rsi_prev is not None and (
-        rsi_prev > params.rsi_extreme_high or rsi_prev < params.rsi_extreme_low
-    ):
-        return None
-
-    if direction == "call":
-        if not (cur_close > vwap_now and cur_close > ema9_now and cur_close > ema21_now):
-            return None
-        if not (rsi_now > params.rsi_long_thresh):
-            return None
-    else:
-        if not (cur_close < vwap_now and cur_close < ema9_now and cur_close < ema21_now):
-            return None
-        if not (rsi_now < params.rsi_short_thresh):
-            return None
-
-    return Signal(
-        timestamp=ts, signal_type="breakout", direction=direction,
-        spot=cur_close, orh=levels.orh, orl=levels.orl,
-        vwap=vwap_now, ema9=ema9_now, ema21=ema21_now,
-        rsi_cross_day=rsi_now, rsi_intraday=None,
-    )
-
-
-def _check_reversal_indicators(
-    direction: str, cur_close: float, ts, levels,
-    vwap, ema9, rsi_xd, rsi_intra, params,
-) -> Signal | None:
-    """Indicator alignment check for a reversal-direction scan."""
-    vwap_now = _value_at(vwap, ts)
-    ema9_now = _value_at(ema9, ts)
-    rsi_xd_now = _value_at(rsi_xd, ts)
-    rsi_intra_now = _value_at(rsi_intra, ts)
-    if None in (vwap_now, ema9_now, rsi_xd_now, rsi_intra_now):
-        return None
-
-    if direction == "call":
-        if not (cur_close > vwap_now and cur_close > ema9_now):
-            return None
-        if not (rsi_xd_now > params.rsi_long_thresh and rsi_intra_now > params.rsi_long_thresh):
-            return None
-        if params.reversal_call_skip_lo <= rsi_xd_now <= params.reversal_call_skip_hi:
-            return None
-    else:
-        if not (cur_close < vwap_now and cur_close < ema9_now):
-            return None
-        if not (rsi_xd_now < params.rsi_short_thresh and rsi_intra_now < params.rsi_short_thresh):
-            return None
-
-    return Signal(
-        timestamp=ts, signal_type="reversal", direction=direction,
-        spot=cur_close, orh=levels.orh, orl=levels.orl,
-        vwap=vwap_now, ema9=ema9_now, ema21=float("nan"),
-        rsi_cross_day=rsi_xd_now, rsi_intraday=rsi_intra_now,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -420,7 +452,6 @@ def pick_atm_contract(
     contracts: list[dict],
     underlying: str = "SPY",
 ) -> tuple[str, float] | None:
-    """Pick the call (long signal) or put (short signal) closest to spot."""
     want_type = "call" if signal.direction == "call" else "put"
     right = "C" if signal.direction == "call" else "P"
     candidates = [

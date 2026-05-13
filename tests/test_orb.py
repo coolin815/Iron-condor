@@ -1,131 +1,152 @@
-"""Tests for the breakout+reversal strategy."""
+"""Tests for the candle-pattern strategy."""
 from __future__ import annotations
 
-from datetime import date, time
-
-import numpy as np
 import pandas as pd
+import pytest
 
-from iron_condor.config import StrategyParams
 from iron_condor.orb import (
-    aggregate_to_5min,
-    ema,
-    find_signal,
-    intraday_5min_rsi,
-    opening_range,
-    session_vwap,
+    detect_first_pattern,
+    is_bearish_engulfing,
+    is_bullish_engulfing,
+    is_dark_cloud,
+    is_evening_star,
+    is_hammer,
+    is_morning_star,
+    is_piercing,
+    is_shooting_star,
+    is_three_black_crows,
+    is_three_white_soldiers,
 )
 
 
-def _bars(start_iso: str, n_minutes: int, prices: list[float], volume: int = 1000) -> pd.DataFrame:
-    """Build a 1-min OHLCV DataFrame starting at `start_iso` (ET-naive)."""
-    idx = pd.date_range(start_iso, periods=n_minutes, freq="1min").tz_localize("America/New_York")
-    if len(prices) != n_minutes:
-        # If a flat list of length 1 is passed, broadcast.
-        if len(prices) == 1:
-            prices = prices * n_minutes
-        else:
-            raise ValueError(f"expected {n_minutes} prices, got {len(prices)}")
-    return pd.DataFrame(
-        {
-            "open":   prices,
-            "high":   prices,
-            "low":    prices,
-            "close":  prices,
-            "volume": [volume] * n_minutes,
-        },
-        index=idx,
-    )
+def C(o, h, l, c):
+    """Build a single-bar dict-like accessible via [\"open\"], etc."""
+    return pd.Series({"open": float(o), "high": float(h), "low": float(l), "close": float(c)})
 
 
-def test_opening_range_30min_uses_touched_high_low() -> None:
-    # 30 1-min bars from 9:30 inclusive — last in-OR bar is 9:59
-    prices = [500.0] * 30
-    prices[5] = 505.0   # 9:35 spike
-    prices[10] = 495.0  # 9:40 dip
-    df = _bars("2026-05-12 09:30", 30, prices)
-    # Use the OHLC convention: high/low equal close in our synthetic. Let's set them properly.
-    df["high"] = df["close"]
-    df["low"] = df["close"]
-    levels = opening_range(df, or_window_min=30)
-    assert levels.orh == 505.0
-    assert levels.orl == 495.0
+# ---------------------------------------------------------------------------
+# 1-2. Three White Soldiers / Three Black Crows
+# ---------------------------------------------------------------------------
 
 
-def test_session_vwap_resets_at_open_and_weights_by_volume() -> None:
-    # Two bars: 100 at vol 1000, 200 at vol 3000 -> VWAP = (100*1000+200*3000)/4000 = 175
-    idx = pd.to_datetime(["2026-05-12 09:30", "2026-05-12 09:31"]).tz_localize("America/New_York")
-    df = pd.DataFrame(
-        {
-            "open":   [100, 200],
-            "high":   [100, 200],
-            "low":    [100, 200],
-            "close":  [100, 200],
-            "volume": [1000, 3000],
-        },
-        index=idx,
-    )
-    v = session_vwap(df)
-    assert abs(v.iloc[-1] - 175.0) < 0.01
+def test_three_white_soldiers_fires_on_clean_ramp() -> None:
+    c1 = C(100, 101, 99.8, 101)
+    c2 = C(101, 102, 100.8, 102)
+    c3 = C(102, 103, 101.8, 103)
+    assert is_three_white_soldiers(c1, c2, c3)
 
 
-def test_ema_periods_make_sense_on_a_trending_series() -> None:
-    closes = pd.Series(np.linspace(100, 110, 50))
-    e9 = ema(closes, 9)
-    e21 = ema(closes, 21)
-    # On a rising series, faster EMA leads slower EMA.
-    assert e9.iloc[-1] > e21.iloc[-1]
+def test_three_white_soldiers_rejects_a_red_candle() -> None:
+    c1 = C(100, 101, 99.8, 101)
+    c2 = C(101, 101.5, 100.5, 100.8)   # red
+    c3 = C(101, 102, 100.8, 102)
+    assert not is_three_white_soldiers(c1, c2, c3)
 
 
-def test_intraday_rsi_warmup_is_70_minutes() -> None:
-    # 100 1-min bars of an uptrend - aggregates to 20 5-min bars. RSI(14) needs
-    # 14 bars to start, then a few more to warm up the smoothing.
-    prices = list(np.linspace(500, 510, 100))
-    df = _bars("2026-05-12 09:30", 100, prices)
-    df["high"] = df["close"] + 0.1
-    df["low"] = df["close"] - 0.1
-    df["open"] = df["close"]
-    rsi = intraday_5min_rsi(df)
-    # First bar at index 0 should be NaN (no warmup yet)
-    assert pd.isna(rsi.iloc[0])
-    # By bar 14 we should have a non-NaN RSI value
-    assert pd.notna(rsi.iloc[15])
+def test_three_black_crows_fires_on_clean_drop() -> None:
+    c1 = C(103, 103.2, 102, 102)
+    c2 = C(102, 102.2, 101, 101)
+    c3 = C(101, 101.2, 100, 100)
+    assert is_three_black_crows(c1, c2, c3)
 
 
-def test_no_signal_on_friday_when_skip_enabled() -> None:
-    # 2026-05-15 is a Friday
-    prices = [500.0] * 60
-    prices[35] = 510.0
-    prices[36] = 510.0
-    df = _bars("2026-05-15 09:30", 60, prices)
-    df["high"] = df["close"]
-    df["low"] = df["close"]
-    params = StrategyParams(skip_fridays=True)
-    sig = find_signal(df, _bars("2026-05-14 09:30", 0, []), params)
-    assert sig is None
-    # If we override the Friday skip, the signal still may not fire because
-    # we didn't fully construct VWAP/EMA/RSI data, but the day-of-week gate
-    # should not be what blocks it.
-    params2 = StrategyParams(skip_fridays=False)
-    # Just check the friday-skip path is the only thing that changed; result
-    # may still be None for data reasons, but should NOT short-circuit at top.
-    sig2 = find_signal(df, _bars("2026-05-14 09:30", 0, []), params2)
-    # Don't assert sig2 is non-None — too many other constraints — just that
-    # `skip_fridays=True` produced the friday-skip path.
-    assert sig is None  # confirmed above; this just keeps the test focused
+# ---------------------------------------------------------------------------
+# 3-4. Morning Star / Evening Star
+# ---------------------------------------------------------------------------
 
 
-def test_aggregate_to_5min_rolls_correctly() -> None:
-    prices = list(range(390, 390 + 30))  # 30 1-min bars
-    df = _bars("2026-05-12 09:30", 30, prices)
-    df["high"] = df["close"] + 0.5
-    df["low"] = df["close"] - 0.5
-    df["open"] = df["close"]
-    agg = aggregate_to_5min(df)
-    # 30 1-min bars -> 6 5-min bars
-    assert len(agg) == 6
-    # First 5-min bar: opens at first price, high = max of 5, low = min of 5
-    assert agg["open"].iloc[0] == 390
-    assert agg["high"].iloc[0] == 394 + 0.5
-    assert agg["low"].iloc[0] == 390 - 0.5
-    assert agg["close"].iloc[0] == 394
+def test_morning_star_fires() -> None:
+    # Big bear, tiny middle, big bull closing past c1 midpoint
+    c1 = C(105, 105.1, 99.9, 100)      # big bearish, midpoint 102.5
+    c2 = C(100, 100.2, 99.5, 99.8)     # small body
+    c3 = C(100, 105, 99.9, 104)        # big bullish, closes 104 > 102.5
+    assert is_morning_star(c1, c2, c3)
+
+
+def test_evening_star_fires() -> None:
+    c1 = C(100, 105.1, 99.9, 105)      # big bullish, midpoint 102.5
+    c2 = C(105, 105.5, 104.8, 105.2)   # small body
+    c3 = C(105, 105.1, 100, 101)       # big bearish, closes 101 < 102.5
+    assert is_evening_star(c1, c2, c3)
+
+
+# ---------------------------------------------------------------------------
+# 5-6. Engulfing + confirmation
+# ---------------------------------------------------------------------------
+
+
+def test_bullish_engulfing_with_confirmation() -> None:
+    c1 = C(101, 101.2, 99.8, 100)      # bearish
+    c2 = C(99.8, 102, 99.7, 101.5)     # bullish, engulfs c1 body
+    c3 = C(101.5, 102.5, 101.4, 102.2) # bullish continuation
+    assert is_bullish_engulfing(c1, c2, c3)
+
+
+def test_bearish_engulfing_with_confirmation() -> None:
+    c1 = C(100, 101.2, 99.9, 101)
+    c2 = C(101.2, 101.3, 99.5, 99.8)
+    c3 = C(99.8, 99.9, 98.5, 98.8)
+    assert is_bearish_engulfing(c1, c2, c3)
+
+
+# ---------------------------------------------------------------------------
+# 7-8. Hammer / Shooting Star + confirmation
+# ---------------------------------------------------------------------------
+
+
+def test_hammer_with_confirmation() -> None:
+    c1 = C(102, 102.1, 100.9, 101)     # bearish
+    # Hammer: tiny body near top, long lower wick
+    c2 = C(101.1, 101.2, 99.5, 101.0)  # body 0.1, lower wick 1.5
+    c3 = C(101.0, 102.5, 100.9, 102.0) # bullish, close > c2 close
+    assert is_hammer(c1, c2, c3)
+
+
+def test_shooting_star_with_confirmation() -> None:
+    c1 = C(100, 101.1, 99.9, 101)
+    c2 = C(100.9, 102.5, 100.8, 101.0) # body 0.1, upper wick 1.5
+    c3 = C(101.0, 101.1, 99.5, 99.8)
+    assert is_shooting_star(c1, c2, c3)
+
+
+# ---------------------------------------------------------------------------
+# 9-10. Piercing / Dark Cloud + confirmation
+# ---------------------------------------------------------------------------
+
+
+def test_piercing_with_confirmation() -> None:
+    c1 = C(105, 105.1, 99.9, 100)      # big bear, midpoint 102.5
+    c2 = C(99.5, 103.5, 99.4, 103)     # opens below c1 close, closes > midpoint, < c1 open
+    c3 = C(103, 104, 102.9, 103.8)
+    assert is_piercing(c1, c2, c3)
+
+
+def test_dark_cloud_with_confirmation() -> None:
+    c1 = C(100, 105.1, 99.9, 105)      # big bull, midpoint 102.5
+    c2 = C(105.5, 105.6, 101.5, 102)   # opens above c1 close, closes < midpoint, > c1 open
+    c3 = C(102, 102.1, 100.9, 101)
+    assert is_dark_cloud(c1, c2, c3)
+
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_returns_first_match() -> None:
+    # Build a 3 White Soldiers setup, dispatch should pick it first.
+    c1 = C(100, 101, 99.8, 101)
+    c2 = C(101, 102, 100.8, 102)
+    c3 = C(102, 103, 101.8, 103)
+    match = detect_first_pattern(c1, c2, c3)
+    assert match is not None
+    assert match[0] == "three_white_soldiers"
+    assert match[1] == "call"
+
+
+def test_dispatch_returns_none_when_no_pattern() -> None:
+    # Three flat doji-like candles
+    c1 = C(100, 100.1, 99.9, 100)
+    c2 = C(100, 100.1, 99.9, 100)
+    c3 = C(100, 100.1, 99.9, 100)
+    assert detect_first_pattern(c1, c2, c3) is None
