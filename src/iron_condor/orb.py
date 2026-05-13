@@ -422,10 +422,14 @@ def find_signal(
             continue
         pattern_name, direction = match
 
-        # Confirmations on this bar's close (indicator values at the 5-min
-        # bar's left-label include the full bar by construction)
+        # Confirmations on this bar's close. EMAs and RSI are indexed by the
+        # 5-min bar's left label and the value AT that label includes the
+        # full bar (so they're already the right value at signal_ts).
+        # VWAP is indexed by 1-min timestamps; vwap.loc[T] = VWAP through end
+        # of the 1-min bar at T (= VWAP at time T+1). At signal_ts we want
+        # the VWAP through the last 1-min bar before signal_ts:00.
         close = float(c3["close"])
-        vwap_now = _vwap_at(vwap, ts)
+        vwap_now = _vwap_at(vwap, signal_ts - pd.Timedelta(minutes=1))
         ema9_now = float(ema9.loc[ts]) if ts in ema9.index and pd.notna(ema9.loc[ts]) else None
         ema21_now = float(ema21.loc[ts]) if ts in ema21.index and pd.notna(ema21.loc[ts]) else None
         rsi_now = float(rsi.loc[ts]) if ts in rsi.index and pd.notna(rsi.loc[ts]) else None

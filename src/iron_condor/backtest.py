@@ -93,14 +93,20 @@ def _reindex_option_bars(bars: pd.DataFrame, day: date) -> pd.DataFrame:
     return bars.reindex(grid).ffill()
 
 
-def _leg_mid(bars: pd.DataFrame, ts: pd.Timestamp) -> float | None:
+def _leg_price(bars: pd.DataFrame, ts: pd.Timestamp, column: str = "close") -> float | None:
+    """Return the option's `column` (open/high/low/close) at minute `ts`."""
     try:
-        v = bars.loc[ts, "close"]
+        v = bars.loc[ts, column]
     except KeyError:
         return None
     if pd.isna(v):
         return None
     return float(v)
+
+
+def _leg_mid(bars: pd.DataFrame, ts: pd.Timestamp) -> float | None:
+    """Backwards-compatible alias for close-price lookup."""
+    return _leg_price(bars, ts, "close")
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +193,9 @@ def simulate_day(
     entry_ts = pd.Timestamp(signal.timestamp).tz_convert(
         "America/New_York"
     ).floor("min")
-    entry_mid = _leg_mid(opt_bars, entry_ts)
+    # "Read candle close, buy candle open" — entry at the OPEN of the
+    # 1-min option bar at signal time (the price at signal_ts:00).
+    entry_mid = _leg_price(opt_bars, entry_ts, "open")
     if entry_mid is None or entry_mid <= 0.05:
         base.exit_reason = "no_data"
         return base
