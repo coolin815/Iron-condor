@@ -20,8 +20,9 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from datetime import date, time, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -96,7 +97,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.smoke:
         from .backtest import _trading_days
-        end = date.today() - timedelta(days=1)
+        et_today = datetime.now(ZoneInfo("America/New_York")).date()
+        end = et_today - timedelta(days=1)
         start = end - timedelta(days=10)
         days = _trading_days(start, end)
         if not days:
@@ -112,7 +114,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.start and args.end:
         start, end = args.start, args.end
     else:
-        end = date.today() - timedelta(days=1)
+        # Use ET-aware date so Colab (which runs in UTC) doesn't pick "today"
+        # when ET is still on the previous day. We always end on yesterday ET
+        # to ensure Polygon has the full day's aggregates ingested.
+        et_today = datetime.now(ZoneInfo("America/New_York")).date()
+        end = et_today - timedelta(days=1)
         start = end - timedelta(days=args.days)
 
     print(f"Backtest window: {start} -> {end}")

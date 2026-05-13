@@ -157,16 +157,28 @@ class PolygonClient:
         """1-minute aggregates for `ticker` on a single calendar day.
 
         Returns a DataFrame indexed by ET timestamp with columns
-        [open, high, low, close, volume, vwap, n].
+        [open, high, low, close, volume, vwap, n]. Returns an empty frame if
+        Polygon doesn't have the data (e.g. 403 on today's incomplete date).
         """
         cache = self._cache_path(f"bars_{ticker}", day.isoformat(), "parquet")
         if cache.exists() and not force:
             return pd.read_parquet(cache)
 
         path = f"/v2/aggs/ticker/{ticker}/range/1/minute/{day}/{day}"
-        data = self._get(
-            path, {"adjusted": "true", "sort": "asc", "limit": 50000}
-        )
+        try:
+            data = self._get(
+                path, {"adjusted": "true", "sort": "asc", "limit": 50000}
+            )
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 403:
+                log.warning(
+                    "Polygon 403 for %s on %s — no permission/data; skipping day",
+                    ticker, day,
+                )
+                return pd.DataFrame(
+                    columns=["open", "high", "low", "close", "volume", "vwap", "n"]
+                )
+            raise
         results = data.get("results") or []
         if not results:
             df = pd.DataFrame(
@@ -237,9 +249,20 @@ class PolygonClient:
             return pd.read_parquet(cache)
 
         path = f"/v2/aggs/ticker/{option_ticker}/range/1/minute/{day}/{day}"
-        data = self._get(
-            path, {"adjusted": "true", "sort": "asc", "limit": 50000}
-        )
+        try:
+            data = self._get(
+                path, {"adjusted": "true", "sort": "asc", "limit": 50000}
+            )
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 403:
+                log.warning(
+                    "Polygon 403 for %s on %s — no permission/data; skipping",
+                    option_ticker, day,
+                )
+                return pd.DataFrame(
+                    columns=["open", "high", "low", "close", "volume", "vwap", "n"]
+                )
+            raise
         results = data.get("results") or []
         if not results:
             df = pd.DataFrame(
