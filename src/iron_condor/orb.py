@@ -319,9 +319,12 @@ PATTERN_DETECTORS = (
 )
 
 
-def detect_first_pattern(c1, c2, c3):
-    """Run all 10 detectors; return (name, direction) for the first match, else None."""
+def detect_first_pattern(c1, c2, c3, enabled: tuple[str, ...] | None = None):
+    """Run pattern detectors in priority order. If `enabled` is given, only
+    those pattern names are considered. Returns (name, direction) or None."""
     for name, detector, direction in PATTERN_DETECTORS:
+        if enabled is not None and name not in enabled:
+            continue
         if detector(c1, c2, c3):
             return name, direction
     return None
@@ -417,7 +420,7 @@ def find_signal(
         c1 = bars.iloc[i - 2]
         c2 = bars.iloc[i - 1]
         c3 = bars.iloc[i]
-        match = detect_first_pattern(c1, c2, c3)
+        match = detect_first_pattern(c1, c2, c3, enabled=params.enabled_patterns)
         if match is None:
             continue
         pattern_name, direction = match

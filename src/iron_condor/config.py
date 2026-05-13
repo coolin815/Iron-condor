@@ -40,6 +40,9 @@ class StrategyParams:
     rsi_short_thresh: float = 50.0
     skip_fridays: bool = True
 
+    # Which patterns to scan. Default = all 10. CLI can narrow via --pattern.
+    enabled_patterns: tuple[str, ...] = PATTERN_NAMES
+
     # P&L measurement: "gross" (option mid-to-mid) or "net" (after fees)
     pnl_mode: Literal["gross", "net"] = "gross"
 

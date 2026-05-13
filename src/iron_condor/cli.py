@@ -11,12 +11,13 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from .backtest import run_backtest, run_sweep, simulate_day
-from .config import ENTRY_CUTOFFS, TIME_STOPS, StrategyParams
+from .config import ENTRY_CUTOFFS, PATTERN_NAMES, TIME_STOPS, StrategyParams
 from .metrics import summarize_run, summarize_sweep
 from .polygon_client import PolygonClient
 
 RESULTS_DIR = Path(__file__).resolve().parents[2] / "results"
 _VALID_PNL_MODES = {"gross", "net"}
+_VALID_PATTERNS = set(PATTERN_NAMES)
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -43,6 +44,14 @@ def _parse_pnl_mode(s: str) -> str:
     return s
 
 
+def _parse_pattern(s: str) -> str:
+    if s not in _VALID_PATTERNS:
+        raise argparse.ArgumentTypeError(
+            f"invalid pattern {s!r}; must be one of {sorted(_VALID_PATTERNS)}"
+        )
+    return s
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description="SPY 0DTE Candle-Pattern backtester (10 patterns, 5-min)"
@@ -60,6 +69,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--pnl-mode", type=_parse_pnl_mode, action="append",
                    help="P&L measurement: gross (mid-to-mid) or net (after fees). "
                         "Default: gross. Repeatable.")
+    p.add_argument("--pattern", type=_parse_pattern, action="append",
+                   help=f"Restrict scan to these patterns: {sorted(_VALID_PATTERNS)}. "
+                        "Default: all 10. Repeatable.")
+    p.add_argument("--pt", type=float, action="append",
+                   help="Profit target as fraction (e.g. 0.10). Default: 0.10. Repeatable.")
+    p.add_argument("--sl", type=float, action="append",
+                   help="Stop loss as fraction (e.g. 0.10). Default: 0.20. Repeatable.")
     p.add_argument("--include-fridays", action="store_true",
                    help="Override the default Friday-skip rule.")
 
@@ -69,7 +85,11 @@ def main(argv: list[str] | None = None) -> int:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     client = PolygonClient()
 
-    base_params = StrategyParams(skip_fridays=not args.include_fridays)
+    enabled_patterns = tuple(args.pattern) if args.pattern else PATTERN_NAMES
+    base_params = StrategyParams(
+        skip_fridays=not args.include_fridays,
+        enabled_patterns=enabled_patterns,
+    )
 
     if args.smoke:
         from .backtest import _trading_days
@@ -84,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
                 break
         if target is None:
             target = days[-1] if days else end
-        print(f"Smoke test on {target}")
+        print(f"Smoke test on {target}, patterns={enabled_patterns}")
         result = simulate_day(target, base_params, base_params.starting_balance, client)
         print(result)
         return 0
@@ -101,11 +121,15 @@ def main(argv: list[str] | None = None) -> int:
         time_stops = args.time_stop or list(TIME_STOPS)
         entry_cutoffs = args.co or list(ENTRY_CUTOFFS)
         pnl_modes = args.pnl_mode or [base_params.pnl_mode]
-        n = len(time_stops) * len(entry_cutoffs) * len(pnl_modes)
+        profit_targets = args.pt or [base_params.profit_target_pct]
+        stop_losses = args.sl or [base_params.stop_loss_pct]
+        n = (len(time_stops) * len(entry_cutoffs) * len(pnl_modes)
+             * len(profit_targets) * len(stop_losses))
         print(
             f"Sweep: {n} configs (ts={time_stops}, "
             f"co={[c.isoformat(timespec='minutes') for c in entry_cutoffs]}, "
-            f"pnl={pnl_modes}, skip_fridays={base_params.skip_fridays})"
+            f"pnl={pnl_modes}, pt={profit_targets}, sl={stop_losses}, "
+            f"patterns={list(enabled_patterns)}, skip_fridays={base_params.skip_fridays})"
         )
 
         sweep_df = run_sweep(
@@ -113,6 +137,8 @@ def main(argv: list[str] | None = None) -> int:
             time_stops=time_stops,
             entry_cutoffs=entry_cutoffs,
             pnl_modes=pnl_modes,
+            profit_targets=profit_targets,
+            stop_losses=stop_losses,
             base_params=base_params,
             client=client,
         )

@@ -303,21 +303,27 @@ def run_sweep(
     time_stops: Iterable[int] = TIME_STOPS,
     entry_cutoffs: Iterable[time] = ENTRY_CUTOFFS,
     pnl_modes: Iterable[str] = ("gross",),
+    profit_targets: Iterable[float] | None = None,
+    stop_losses: Iterable[float] | None = None,
     base_params: StrategyParams | None = None,
     client: PolygonClient | None = None,
 ) -> pd.DataFrame:
-    """Sweep (time_stop × entry_cutoff × pnl_mode)."""
+    """Sweep (time_stop × entry_cutoff × pnl_mode × pt × sl)."""
     client = client or PolygonClient()
     base = base_params or StrategyParams()
+    pts = list(profit_targets) if profit_targets is not None else [base.profit_target_pct]
+    sls = list(stop_losses) if stop_losses is not None else [base.stop_loss_pct]
     all_rows: list[pd.DataFrame] = []
 
     combos = [
-        (ts, co, pm)
+        (ts, co, pm, pt, sl)
         for ts in time_stops
         for co in entry_cutoffs
         for pm in pnl_modes
+        for pt in pts
+        for sl in sls
     ]
-    for ts_min, co, pm in combos:
+    for ts_min, co, pm, pt, sl in combos:
         params = StrategyParams(
             bar_timeframe_min=base.bar_timeframe_min,
             earliest_entry=base.earliest_entry,
@@ -327,15 +333,19 @@ def run_sweep(
             rsi_long_thresh=base.rsi_long_thresh,
             rsi_short_thresh=base.rsi_short_thresh,
             skip_fridays=base.skip_fridays,
+            enabled_patterns=base.enabled_patterns,
             pnl_mode=pm,
-            profit_target_pct=base.profit_target_pct,
-            stop_loss_pct=base.stop_loss_pct,
+            profit_target_pct=pt,
+            stop_loss_pct=sl,
             commission_per_contract=base.commission_per_contract,
             leg_half_spread=base.leg_half_spread,
             starting_balance=base.starting_balance,
             max_capital_per_trade=base.max_capital_per_trade,
         )
         df = run_backtest(params, start, end, client=client)
-        df["config"] = f"ts{ts_min}|co{co.strftime('%H%M')}|pnl={pm}"
+        df["config"] = (
+            f"ts{ts_min}|co{co.strftime('%H%M')}|pnl={pm}"
+            f"|pt{int(pt*100)}|sl{int(sl*100)}"
+        )
         all_rows.append(df)
     return pd.concat(all_rows, ignore_index=True)
