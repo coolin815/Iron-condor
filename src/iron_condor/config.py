@@ -1,5 +1,6 @@
-"""Strategy parameters and sweep grids for the SPY 0DTE ORB strategy.
+"""Strategy parameters for the SPY 0DTE breakout-and-reversal strategy.
 
+Single trade per day, whichever signal (breakout or reversal) fires first.
 All times are NY-market local (US/Eastern).
 """
 from __future__ import annotations
@@ -9,18 +10,10 @@ from datetime import time
 from typing import Literal
 
 UNDERLYING: str = "SPY"
-RISK_FREE_RATE: float = 0.045  # kept for any greek calcs we add later
+RISK_FREE_RATE: float = 0.045
 
-# ---------------------------------------------------------------------------
-# Confluence levels
-# ---------------------------------------------------------------------------
+SignalMode = Literal["both", "breakout", "reversal"]
 
-ConfluenceLevel = Literal["none", "pdh_pdl", "pmh_pml", "onh_onl", "any"]
-# "none"    = take any ORH/ORL break
-# "pdh_pdl" = long break must also clear PDH; short break must also clear PDL
-# "pmh_pml" = same with premarket high/low
-# "onh_onl" = same with overnight high/low (post yesterday's close, pre today's open)
-# "any"     = clear any of PDH/PMH/ONH on long side (or PDL/PML/ONL on short)
 
 # ---------------------------------------------------------------------------
 # Single-run strategy parameters
@@ -29,27 +22,30 @@ ConfluenceLevel = Literal["none", "pdh_pdl", "pmh_pml", "onh_onl", "any"]
 
 @dataclass(frozen=True)
 class StrategyParams:
-    # Signal
-    or_window_min: int = 15                # opening range length in minutes
-    confluence: ConfluenceLevel = "none"
-    earliest_entry: time = time(9, 45)     # don't trade in the OR window itself
-    latest_entry: time = time(11, 0)       # 8:00 AM PT — no new trades after this
-    time_stop_min: int = 30                # max minutes to hold a position
-    hard_close: time = time(15, 55)        # safety net before 4 PM ET
+    # Signal config
+    or_window_min: int = 30                # opening range = first 30 min
+    earliest_entry: time = time(10, 0)     # immediately after OR window closes
+    latest_entry: time = time(15, 30)      # no new entries this late
+    time_stop_min: int = 60                # cap holding period
+    hard_close: time = time(15, 55)        # safety net
 
-    # Filters (default = off / pass-through)
-    min_break_pct: float = 0.0             # require break by >= this % past ORH/ORL
-    vol_mult: float = 0.0                  # require break-bar vol >= vol_mult * 20-bar avg
-    vwap_filter: bool = False              # long: close > VWAP; short: close < VWAP
-    premarket_bias: bool = False           # long: premarket up; short: premarket down
+    # Filter values (per the strategy spec)
+    rsi_long_thresh: float = 50.0          # cross-day RSI must be > this for calls
+    rsi_short_thresh: float = 50.0         # cross-day RSI must be < this for puts
+    rsi_extreme_high: float = 70.0         # breakout skip if RSI > this in last 5 min
+    rsi_extreme_low: float = 30.0          # breakout skip if RSI < this in last 5 min
+    reversal_call_skip_lo: float = 60.0    # reversal calls skip if RSI in [lo, hi]
+    reversal_call_skip_hi: float = 65.0
+    skip_fridays: bool = True
+    signal_mode: SignalMode = "both"       # which signal type(s) to enable
 
     # Net-of-fees exits
-    profit_target_pct: float = 0.05        # +5% on capital deployed (after fees)
-    stop_loss_pct: float = 0.10            # -10% on capital deployed
+    profit_target_pct: float = 0.10        # +10% on capital deployed
+    stop_loss_pct: float = 0.20            # -20% on capital deployed
 
     # Execution
     commission_per_contract: float = 0.85
-    leg_half_spread: float = 0.005         # half of single-leg bid-ask
+    leg_half_spread: float = 0.005
 
     # Account
     starting_balance: float = 1500.0
@@ -57,29 +53,15 @@ class StrategyParams:
 
 
 # ---------------------------------------------------------------------------
-# Sweep grids
+# Sweep grids (small — strategy is mostly fixed per spec)
 # ---------------------------------------------------------------------------
 
-OR_WINDOWS: tuple[int, ...] = (5, 15, 30)
+SIGNAL_MODES: tuple[SignalMode, ...] = ("both", "breakout", "reversal")
+TIME_STOPS: tuple[int, ...] = (30, 60, 120)
 
-CONFLUENCE_LEVELS: tuple[ConfluenceLevel, ...] = ("none", "any")
-
-PROFIT_TARGETS: tuple[float, ...] = (0.03, 0.05, 0.07, 0.10)
-
-STOP_LOSSES: tuple[float, ...] = (0.05, 0.10, 0.15)
-
-TIME_STOPS: tuple[int, ...] = (15, 30, 60)
-
-# Filter sweep grids (default is just "off" so the base sweep is unchanged).
-MIN_BREAK_PCTS: tuple[float, ...] = (0.0,)
-VOL_MULTS: tuple[float, ...] = (0.0,)
-VWAP_FILTERS: tuple[bool, ...] = (False,)
-PREMARKET_BIASES: tuple[bool, ...] = (False,)
-
-# Entry cutoffs in NY (ET) time. PT in parens:
-#   10:30 ET = 7:30 PT, 11:00 ET = 8:00 PT, 11:30 ET = 8:30 PT
+# Entry cutoffs — when do we stop opening new positions for the day
 ENTRY_CUTOFFS: tuple[time, ...] = (
-    time(10, 30),
-    time(11, 0),
     time(11, 30),
+    time(13, 0),
+    time(15, 30),
 )

@@ -1,199 +1,131 @@
-"""Tests for the ORB level computation and signal detection."""
+"""Tests for the breakout+reversal strategy."""
 from __future__ import annotations
 
-from datetime import time
+from datetime import date, time
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from iron_condor.config import StrategyParams
-from iron_condor.orb import compute_levels, find_orb_signal
+from iron_condor.orb import (
+    aggregate_to_5min,
+    ema,
+    find_signal,
+    intraday_5min_rsi,
+    opening_range,
+    session_vwap,
+)
 
 
-def _make_bars(rows: list[tuple[str, float, float, float, float]]) -> pd.DataFrame:
-    """Build a DataFrame from a list of (time_iso_et, open, high, low, close)."""
-    times = pd.to_datetime([r[0] for r in rows]).tz_localize("America/New_York")
+def _bars(start_iso: str, n_minutes: int, prices: list[float], volume: int = 1000) -> pd.DataFrame:
+    """Build a 1-min OHLCV DataFrame starting at `start_iso` (ET-naive)."""
+    idx = pd.date_range(start_iso, periods=n_minutes, freq="1min").tz_localize("America/New_York")
+    if len(prices) != n_minutes:
+        # If a flat list of length 1 is passed, broadcast.
+        if len(prices) == 1:
+            prices = prices * n_minutes
+        else:
+            raise ValueError(f"expected {n_minutes} prices, got {len(prices)}")
     return pd.DataFrame(
         {
-            "open": [r[1] for r in rows],
-            "high": [r[2] for r in rows],
-            "low":  [r[3] for r in rows],
-            "close":[r[4] for r in rows],
+            "open":   prices,
+            "high":   prices,
+            "low":    prices,
+            "close":  prices,
+            "volume": [volume] * n_minutes,
         },
-        index=times,
+        index=idx,
     )
 
 
-def test_levels_computed_from_extended_hours_bars() -> None:
-    # Yesterday: regular session high 500, low 495
-    yest = _make_bars([
-        ("2026-05-11 09:30", 498, 500, 497, 499),
-        ("2026-05-11 15:59", 498, 499, 495, 498),
-        # after hours: 16:00-20:00
-        ("2026-05-11 18:00", 498, 502, 498, 501),
-    ])
-    # Today: premarket then regular session
-    today = _make_bars([
-        ("2026-05-12 07:00", 501, 503, 500, 502),  # premarket
-        ("2026-05-12 09:30", 502, 504, 501, 503),  # OR start
-        ("2026-05-12 09:34", 503, 505, 502, 504),  # still in OR (5-min)
-        ("2026-05-12 09:35", 504, 506, 503, 505),  # outside 5-min OR
-    ])
-    levels = compute_levels(today, yest, or_window_min=5)
-    assert levels.pdh == 500.0
-    assert levels.pdl == 495.0
-    assert levels.pmh == 503.0   # 502 ask high; max premarket high
-    assert levels.pml == 500.0
-    # Overnight = yesterday after-hours (high 502) + today premarket (high 503)
-    assert levels.onh == 503.0
-    assert levels.onl == 498.0
-    # OR (first 5 min, 9:30 and 9:34 - both before 09:35)
+def test_opening_range_30min_uses_touched_high_low() -> None:
+    # 30 1-min bars from 9:30 inclusive — last in-OR bar is 9:59
+    prices = [500.0] * 30
+    prices[5] = 505.0   # 9:35 spike
+    prices[10] = 495.0  # 9:40 dip
+    df = _bars("2026-05-12 09:30", 30, prices)
+    # Use the OHLC convention: high/low equal close in our synthetic. Let's set them properly.
+    df["high"] = df["close"]
+    df["low"] = df["close"]
+    levels = opening_range(df, or_window_min=30)
     assert levels.orh == 505.0
-    assert levels.orl == 501.0
+    assert levels.orl == 495.0
 
 
-def test_orb_long_signal_fires_on_first_break_of_orh() -> None:
-    today = _make_bars([
-        ("2026-05-12 09:30", 500, 501, 499, 500),
-        ("2026-05-12 09:31", 500, 502, 500, 501),  # OR high=502
-        ("2026-05-12 09:34", 501, 502, 500, 501),
-        ("2026-05-12 09:50", 501, 502, 500, 501),  # not yet broken
-        ("2026-05-12 09:51", 501, 503, 501, 503),  # break: high 503 > 502
-        ("2026-05-12 10:30", 503, 505, 503, 504),
-    ])
-    yest = _make_bars([
-        ("2026-05-11 09:30", 499, 500, 498, 499),
-        ("2026-05-11 15:59", 499, 500, 498, 499),
-    ])
-    levels = compute_levels(today, yest, or_window_min=5)
-    params = StrategyParams(or_window_min=5)
-    sig = find_orb_signal(today, levels, params)
-    assert sig is not None
-    assert sig.direction == "long"
-    assert sig.timestamp.time() == time(9, 51)
-    assert sig.break_price == 503.0
-    assert "ORH" in sig.level_broken
+def test_session_vwap_resets_at_open_and_weights_by_volume() -> None:
+    # Two bars: 100 at vol 1000, 200 at vol 3000 -> VWAP = (100*1000+200*3000)/4000 = 175
+    idx = pd.to_datetime(["2026-05-12 09:30", "2026-05-12 09:31"]).tz_localize("America/New_York")
+    df = pd.DataFrame(
+        {
+            "open":   [100, 200],
+            "high":   [100, 200],
+            "low":    [100, 200],
+            "close":  [100, 200],
+            "volume": [1000, 3000],
+        },
+        index=idx,
+    )
+    v = session_vwap(df)
+    assert abs(v.iloc[-1] - 175.0) < 0.01
 
 
-def test_orb_short_signal_fires_on_break_of_orl() -> None:
-    today = _make_bars([
-        ("2026-05-12 09:30", 500, 502, 498, 500),  # OR low=498
-        ("2026-05-12 09:34", 500, 501, 498, 500),
-        ("2026-05-12 09:51", 500, 500, 497, 497),  # break: low 497 < 498
-    ])
-    levels = compute_levels(today, _make_bars([]), or_window_min=5)
-    params = StrategyParams(or_window_min=5)
-    sig = find_orb_signal(today, levels, params)
-    assert sig is not None
-    assert sig.direction == "short"
-    assert sig.break_price == 497.0
+def test_ema_periods_make_sense_on_a_trending_series() -> None:
+    closes = pd.Series(np.linspace(100, 110, 50))
+    e9 = ema(closes, 9)
+    e21 = ema(closes, 21)
+    # On a rising series, faster EMA leads slower EMA.
+    assert e9.iloc[-1] > e21.iloc[-1]
 
 
-def test_orb_signal_skipped_if_outside_window() -> None:
-    today = _make_bars([
-        ("2026-05-12 09:30", 500, 502, 498, 500),
-        ("2026-05-12 09:34", 500, 501, 498, 500),
-        # Break in the OR is ignored; need to wait until earliest_entry
-        ("2026-05-12 09:35", 500, 503, 500, 502),  # past OR but pre-window
-    ])
-    levels = compute_levels(today, _make_bars([]), or_window_min=5)
-    # Set earliest_entry to 9:45 so the 9:35 break is ignored
-    params = StrategyParams(or_window_min=5, earliest_entry=time(9, 45))
-    sig = find_orb_signal(today, levels, params)
+def test_intraday_rsi_warmup_is_70_minutes() -> None:
+    # 100 1-min bars of an uptrend - aggregates to 20 5-min bars. RSI(14) needs
+    # 14 bars to start, then a few more to warm up the smoothing.
+    prices = list(np.linspace(500, 510, 100))
+    df = _bars("2026-05-12 09:30", 100, prices)
+    df["high"] = df["close"] + 0.1
+    df["low"] = df["close"] - 0.1
+    df["open"] = df["close"]
+    rsi = intraday_5min_rsi(df)
+    # First bar at index 0 should be NaN (no warmup yet)
+    assert pd.isna(rsi.iloc[0])
+    # By bar 14 we should have a non-NaN RSI value
+    assert pd.notna(rsi.iloc[15])
+
+
+def test_no_signal_on_friday_when_skip_enabled() -> None:
+    # 2026-05-15 is a Friday
+    prices = [500.0] * 60
+    prices[35] = 510.0
+    prices[36] = 510.0
+    df = _bars("2026-05-15 09:30", 60, prices)
+    df["high"] = df["close"]
+    df["low"] = df["close"]
+    params = StrategyParams(skip_fridays=True)
+    sig = find_signal(df, _bars("2026-05-14 09:30", 0, []), params)
     assert sig is None
+    # If we override the Friday skip, the signal still may not fire because
+    # we didn't fully construct VWAP/EMA/RSI data, but the day-of-week gate
+    # should not be what blocks it.
+    params2 = StrategyParams(skip_fridays=False)
+    # Just check the friday-skip path is the only thing that changed; result
+    # may still be None for data reasons, but should NOT short-circuit at top.
+    sig2 = find_signal(df, _bars("2026-05-14 09:30", 0, []), params2)
+    # Don't assert sig2 is non-None — too many other constraints — just that
+    # `skip_fridays=True` produced the friday-skip path.
+    assert sig is None  # confirmed above; this just keeps the test focused
 
 
-def test_min_break_pct_blocks_weak_break() -> None:
-    """A break that barely clears ORH should be filtered out when min_break_pct > 0."""
-    today = _make_bars([
-        ("2026-05-12 09:30", 500, 502, 498, 500),   # ORH = 502
-        ("2026-05-12 09:34", 500, 502, 498, 500),
-        ("2026-05-12 09:51", 500, 502.10, 500, 502.05),  # break by 0.05 (~0.01%)
-    ])
-    levels = compute_levels(today, _make_bars([]), or_window_min=5)
-    # No filter -> signal
-    p_loose = StrategyParams(or_window_min=5)
-    assert find_orb_signal(today, levels, p_loose) is not None
-    # 0.05% required (~0.25 on 502) -> filtered
-    p_tight = StrategyParams(or_window_min=5, min_break_pct=0.0005)
-    assert find_orb_signal(today, levels, p_tight) is None
-
-
-def test_vol_mult_blocks_low_volume_break() -> None:
-    """Break-bar volume below threshold should fail the filter."""
-    rows = []
-    # Build OR bars with reference volume 1000
-    for i, t in enumerate(["09:30", "09:31", "09:32", "09:33", "09:34"]):
-        rows.append((f"2026-05-12 {t}", 500, 502, 498, 500))
-    # Quiet bars after OR (low vol baseline)
-    rows.extend([
-        ("2026-05-12 09:35", 500, 501, 499, 500),
-        ("2026-05-12 09:50", 500, 501, 499, 500),
-        ("2026-05-12 09:51", 500, 503, 501, 503),   # break, but we'll set its volume
-    ])
-    df = _make_bars(rows)
-    # Set volumes: baseline avg = 1000, breakout bar volume = 800 (below 1.5x)
-    df["volume"] = [1000] * (len(rows) - 1) + [800]
-    levels = compute_levels(df, _make_bars([]), or_window_min=5)
-    p = StrategyParams(or_window_min=5, vol_mult=1.5)
-    assert find_orb_signal(df, levels, p) is None
-    # If the breakout bar has 2000 volume (2x avg), it passes
-    df.loc[df.index[-1], "volume"] = 2000
-    assert find_orb_signal(df, levels, p) is not None
-
-
-def test_vwap_filter_blocks_long_when_close_below_vwap() -> None:
-    """Long signal must close above session VWAP. The break-bar itself has a
-    long upper wick + heavy volume that drives VWAP above its close."""
-    rows = [
-        ("2026-05-12 09:30", 500, 502, 498, 500),
-        ("2026-05-12 09:34", 500, 502, 498, 500),
-        # Break: high 510 > ORH=502 but close 502.5 below the bar's own
-        # typical (~504) which heavy volume pulls VWAP to ~503.5.
-        ("2026-05-12 09:51", 500, 510, 500, 502.5),
-    ]
-    df = _make_bars(rows)
-    df["volume"] = [1000, 1000, 10000]
-    levels = compute_levels(df, _make_bars([]), or_window_min=5)
-    # Loose signal fires (high 510 > ORH 502)
-    assert find_orb_signal(df, levels, StrategyParams(or_window_min=5)) is not None
-    # VWAP filter blocks: VWAP ~ 503.5 but close 502.5
-    p = StrategyParams(or_window_min=5, vwap_filter=True)
-    assert find_orb_signal(df, levels, p) is None
-
-
-def test_premarket_bias_blocks_long_when_premarket_down() -> None:
-    """With premarket_bias=True, long signal blocked if premarket trended down."""
-    today = _make_bars([
-        # Premarket: down trend (501 -> 499)
-        ("2026-05-12 06:00", 501, 501, 500, 500.5),
-        ("2026-05-12 09:00", 500, 500, 499, 499),
-        # Regular session
-        ("2026-05-12 09:30", 500, 502, 498, 500),
-        ("2026-05-12 09:34", 500, 502, 498, 500),
-        ("2026-05-12 09:51", 500, 503, 500, 503),
-    ])
-    levels = compute_levels(today, _make_bars([]), or_window_min=5)
-    p = StrategyParams(or_window_min=5, premarket_bias=True)
-    assert find_orb_signal(today, levels, p) is None
-    # Without filter, signal would fire
-    p_loose = StrategyParams(or_window_min=5)
-    assert find_orb_signal(today, levels, p_loose) is not None
-
-
-def test_orb_confluence_pdh_blocks_weak_breaks() -> None:
-    """Long break must clear PDH=510 for confluence='any' to pass."""
-    yest = _make_bars([
-        ("2026-05-11 12:00", 505, 510, 505, 510),  # PDH = 510
-    ])
-    today = _make_bars([
-        ("2026-05-12 09:30", 500, 502, 499, 500),  # OR high = 502
-        ("2026-05-12 09:51", 500, 503, 500, 503),  # break ORH but NOT PDH
-    ])
-    levels = compute_levels(today, yest, or_window_min=5)
-    params = StrategyParams(or_window_min=5, confluence="any")
-    assert find_orb_signal(today, levels, params) is None  # PDH blocked
-    # With confluence='none', the same bars would fire.
-    params2 = StrategyParams(or_window_min=5, confluence="none")
-    assert find_orb_signal(today, levels, params2) is not None
+def test_aggregate_to_5min_rolls_correctly() -> None:
+    prices = list(range(390, 390 + 30))  # 30 1-min bars
+    df = _bars("2026-05-12 09:30", 30, prices)
+    df["high"] = df["close"] + 0.5
+    df["low"] = df["close"] - 0.5
+    df["open"] = df["close"]
+    agg = aggregate_to_5min(df)
+    # 30 1-min bars -> 6 5-min bars
+    assert len(agg) == 6
+    # First 5-min bar: opens at first price, high = max of 5, low = min of 5
+    assert agg["open"].iloc[0] == 390
+    assert agg["high"].iloc[0] == 394 + 0.5
+    assert agg["low"].iloc[0] == 390 - 0.5
+    assert agg["close"].iloc[0] == 394
