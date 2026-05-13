@@ -25,7 +25,9 @@ class StrategyParams:
     # Signal config
     or_window_min: int = 30                # opening range = first 30 min
     earliest_entry: time = time(10, 0)     # immediately after OR window closes
-    latest_entry: time = time(15, 30)      # no new entries this late
+    # Per-signal cutoffs (per user spec). 12:30 ET = 9:30 PT; 13:00 ET = 10:00 PT
+    reversal_latest_entry: time = time(12, 30)
+    breakout_latest_entry: time = time(13, 0)
     time_stop_min: int = 60                # cap holding period
     hard_close: time = time(15, 55)        # safety net
 
@@ -39,9 +41,16 @@ class StrategyParams:
     skip_fridays: bool = True
     signal_mode: SignalMode = "both"       # which signal type(s) to enable
 
+    # P&L measurement mode:
+    #   "gross"  - exits trigger on option mid-price change (matches simple
+    #              backtest tools that ignore the bid/ask spread + commissions)
+    #   "net"    - exits trigger on net P&L / capital deployed (after fees +
+    #              paying ask / receiving bid). More realistic but stricter.
+    pnl_mode: Literal["gross", "net"] = "gross"
+
     # Net-of-fees exits
-    profit_target_pct: float = 0.10        # +10% on capital deployed
-    stop_loss_pct: float = 0.20            # -20% on capital deployed
+    profit_target_pct: float = 0.10        # +10%
+    stop_loss_pct: float = 0.20            # -20%
 
     # Execution
     commission_per_contract: float = 0.85

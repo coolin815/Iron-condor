@@ -240,12 +240,22 @@ def find_signal(
         return None
 
     vwap = session_vwap(today_1min)
-    ema9 = ema(reg["close"], 9)
-    ema21 = ema(reg["close"], 21)
+    # Cross-day EMAs: warm up from yesterday's regular session, continue today
+    yest_reg = _between_time(_to_et(yesterday_1min), time(9, 30), time(16, 0))
+    if yest_reg.empty:
+        ema9 = ema(reg["close"], 9)
+        ema21 = ema(reg["close"], 21)
+    else:
+        combined = pd.concat([yest_reg["close"], reg["close"]])
+        ema9 = ema(combined, 9).loc[reg.index]
+        ema21 = ema(combined, 21).loc[reg.index]
     rsi_xd = cross_day_5min_rsi(today_1min, yesterday_1min)
     rsi_intra = intraday_5min_rsi(today_1min)
 
-    bars = reg[(reg.index.time >= params.earliest_entry) & (reg.index.time <= params.latest_entry)]
+    # Use the latest of the two cutoffs to bound the walk; per-signal cutoffs
+    # are applied below per bar.
+    latest_overall = max(params.breakout_latest_entry, params.reversal_latest_entry)
+    bars = reg[(reg.index.time >= params.earliest_entry) & (reg.index.time <= latest_overall)]
     if bars.empty:
         return None
 
@@ -288,8 +298,13 @@ def find_signal(
                 reversal_call_scan = False
             # else: simply still inside — keep any prior reversal scan alive
 
+        # Apply per-signal-type cutoffs at this bar
+        ts_time = ts.time()
+        breakout_open = ts_time <= params.breakout_latest_entry
+        reversal_open = ts_time <= params.reversal_latest_entry
+
         # First-to-fire: check breakout(s) first, then reversal(s)
-        if try_breakout:
+        if try_breakout and breakout_open:
             if consec_above_orh >= 2:
                 sig = _check_breakout_indicators(
                     "call", cur_close, ts, levels,
@@ -305,7 +320,7 @@ def find_signal(
                 if sig is not None:
                     return sig
 
-        if try_reversal:
+        if try_reversal and reversal_open:
             if reversal_call_scan:
                 sig = _check_reversal_indicators(
                     "call", cur_close, ts, levels,

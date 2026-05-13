@@ -18,7 +18,6 @@ import pandas as pd
 from tqdm import tqdm
 
 from .config import (
-    ENTRY_CUTOFFS,
     SIGNAL_MODES,
     TIME_STOPS,
     SignalMode,
@@ -41,8 +40,10 @@ class TradeResult:
     day: date
     # config
     signal_mode: str
+    pnl_mode: str
     time_stop_min: int
-    entry_cutoff: str
+    breakout_cutoff: str
+    reversal_cutoff: str
     skip_fridays: bool
     # signal details
     signal_time: datetime | None
@@ -131,8 +132,10 @@ def simulate_day(
     base = TradeResult(
         day=day,
         signal_mode=params.signal_mode,
+        pnl_mode=params.pnl_mode,
         time_stop_min=params.time_stop_min,
-        entry_cutoff=params.latest_entry.strftime("%H:%M"),
+        breakout_cutoff=params.breakout_latest_entry.strftime("%H:%M"),
+        reversal_cutoff=params.reversal_latest_entry.strftime("%H:%M"),
         skip_fridays=params.skip_fridays,
         signal_time=None,
         signal_type=None,
@@ -240,19 +243,25 @@ def simulate_day(
     exit_ts: pd.Timestamp | None = None
     exit_bid: float | None = None
     exit_reason = "time_stop"
+    use_gross = params.pnl_mode == "gross"
     for ts in forward:
         mid = _leg_mid(opt_bars, ts)
         if mid is None:
             continue
         bid = mid - h
-        gross = (bid - entry_ask) * 100 * qty
-        fees = 2 * params.commission_per_contract * qty
-        net = gross - fees
-        net_pct = net / capital_deployed
-        if net_pct >= params.profit_target_pct:
+        if use_gross:
+            # Exit triggers based on option mid-price change vs entry mid
+            # (matches simple backtest tools). Realized fill still uses bid.
+            exit_pct = (mid - entry_mid) / entry_mid
+        else:
+            gross = (bid - entry_ask) * 100 * qty
+            fees = 2 * params.commission_per_contract * qty
+            net = gross - fees
+            exit_pct = net / capital_deployed
+        if exit_pct >= params.profit_target_pct:
             exit_ts, exit_bid, exit_reason = ts, bid, "profit"
             break
-        if net_pct <= -params.stop_loss_pct:
+        if exit_pct <= -params.stop_loss_pct:
             exit_ts, exit_bid, exit_reason = ts, bid, "stop"
             break
 
@@ -300,7 +309,7 @@ def run_backtest(
     desc = (
         f"mode={params.signal_mode}"
         f"|ts{params.time_stop_min}"
-        f"|co{params.latest_entry.strftime('%H%M')}"
+        f"|pnl={params.pnl_mode}"
         f"|pt{int(params.profit_target_pct*100)}"
         f"|sl{int(params.stop_loss_pct*100)}"
     )
@@ -316,26 +325,28 @@ def run_sweep(
     end: date,
     signal_modes: Iterable[SignalMode] = SIGNAL_MODES,
     time_stops: Iterable[int] = TIME_STOPS,
-    entry_cutoffs=ENTRY_CUTOFFS,
+    pnl_modes: Iterable[str] = ("gross",),
     base_params: StrategyParams | None = None,
     client: PolygonClient | None = None,
 ) -> pd.DataFrame:
-    """Sweep (signal_mode × time_stop × entry_cutoff). PT and SL are fixed."""
+    """Sweep (signal_mode × time_stop × pnl_mode). PT and SL are fixed;
+    cutoffs come from base_params."""
     client = client or PolygonClient()
     base = base_params or StrategyParams()
     all_rows: list[pd.DataFrame] = []
 
     combos = [
-        (sm, ts, co)
+        (sm, ts, pm)
         for sm in signal_modes
         for ts in time_stops
-        for co in entry_cutoffs
+        for pm in pnl_modes
     ]
-    for sm, ts_min, co in combos:
+    for sm, ts_min, pm in combos:
         params = StrategyParams(
             or_window_min=base.or_window_min,
             earliest_entry=base.earliest_entry,
-            latest_entry=co,
+            breakout_latest_entry=base.breakout_latest_entry,
+            reversal_latest_entry=base.reversal_latest_entry,
             time_stop_min=ts_min,
             hard_close=base.hard_close,
             rsi_long_thresh=base.rsi_long_thresh,
@@ -346,6 +357,7 @@ def run_sweep(
             reversal_call_skip_hi=base.reversal_call_skip_hi,
             skip_fridays=base.skip_fridays,
             signal_mode=sm,
+            pnl_mode=pm,
             profit_target_pct=base.profit_target_pct,
             stop_loss_pct=base.stop_loss_pct,
             commission_per_contract=base.commission_per_contract,
@@ -354,8 +366,6 @@ def run_sweep(
             max_capital_per_trade=base.max_capital_per_trade,
         )
         df = run_backtest(params, start, end, client=client)
-        df["config"] = (
-            f"mode={sm}|ts{ts_min}|co{co.strftime('%H%M')}"
-        )
+        df["config"] = f"mode={sm}|ts{ts_min}|pnl={pm}"
         all_rows.append(df)
     return pd.concat(all_rows, ignore_index=True)
