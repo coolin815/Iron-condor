@@ -210,7 +210,18 @@ def find_signal(
 ) -> Signal | None:
     """Find the first breakout or reversal signal in the entry window.
 
-    Returns None if no signal, no data, or it's a Friday and skip_fridays is on.
+    Two-stage logic. The candle PATTERN opens a 'scanning state' that
+    persists across subsequent bars; on each bar in the scanning state, the
+    bot tries to enter when the INDICATORS align.
+
+    Breakout scanning state: count of consecutive closes outside OR (above
+    or below) is >= 2. A close back inside OR resets the count to 0 (which
+    exits the scanning state).
+
+    Reversal scanning state: triggered when a bar closes inside OR after
+    the previous bar closed outside. Persists across subsequent inside
+    closes. Cancelled when price closes back outside OR (a new breakout
+    attempt invalidates the prior reversal pattern).
     """
     if today_1min.empty:
         return None
@@ -223,7 +234,6 @@ def find_signal(
     if levels.orh is None or levels.orl is None:
         return None
 
-    # Pre-compute indicators across the whole day.
     today_et = _to_et(today_1min)
     reg = _between_time(today_et, time(9, 30), time(16, 0))
     if reg.empty:
@@ -235,50 +245,90 @@ def find_signal(
     rsi_xd = cross_day_5min_rsi(today_1min, yesterday_1min)
     rsi_intra = intraday_5min_rsi(today_1min)
 
-    # Walk the regular session, looking for whichever signal fires first.
-    earliest = params.earliest_entry
-    latest = params.latest_entry
-    bars = reg[(reg.index.time >= earliest) & (reg.index.time <= latest)]
-    if len(bars) < 2:
+    bars = reg[(reg.index.time >= params.earliest_entry) & (reg.index.time <= params.latest_entry)]
+    if bars.empty:
         return None
 
-    prev_ts = None
-    prev_close = None
+    try_breakout = params.signal_mode in ("both", "breakout")
+    try_reversal = params.signal_mode in ("both", "reversal")
+
+    # Scanning state
+    consec_above_orh = 0
+    consec_below_orl = 0
+    reversal_call_scan = False     # came back inside from below (dip and recover)
+    reversal_put_scan = False      # came back inside from above (spike and fade)
+
     for ts, row in bars.iterrows():
         cur_close = float(row["close"])
-        if prev_ts is None or prev_close is None:
-            prev_ts, prev_close = ts, cur_close
-            continue
 
-        try_breakout = params.signal_mode in ("both", "breakout")
-        try_reversal = params.signal_mode in ("both", "reversal")
+        prev_above_count = consec_above_orh
+        prev_below_count = consec_below_orl
 
+        if cur_close > levels.orh:
+            consec_above_orh += 1
+            consec_below_orl = 0
+            # Closing outside cancels any reversal scan in progress
+            reversal_call_scan = False
+            reversal_put_scan = False
+        elif cur_close < levels.orl:
+            consec_below_orl += 1
+            consec_above_orh = 0
+            reversal_call_scan = False
+            reversal_put_scan = False
+        else:
+            # Closed back inside OR — count resets
+            consec_above_orh = 0
+            consec_below_orl = 0
+            # New reversal scans are triggered when prior bar was outside
+            if prev_below_count >= 1:
+                reversal_call_scan = True
+                reversal_put_scan = False
+            elif prev_above_count >= 1:
+                reversal_put_scan = True
+                reversal_call_scan = False
+            # else: simply still inside — keep any prior reversal scan alive
+
+        # First-to-fire: check breakout(s) first, then reversal(s)
         if try_breakout:
-            sig = _check_breakout(
-                prev_close, cur_close, ts, row, levels,
-                vwap, ema9, ema21, rsi_xd, params,
-            )
-            if sig is not None:
-                return sig
+            if consec_above_orh >= 2:
+                sig = _check_breakout_indicators(
+                    "call", cur_close, ts, levels,
+                    vwap, ema9, ema21, rsi_xd, params,
+                )
+                if sig is not None:
+                    return sig
+            elif consec_below_orl >= 2:
+                sig = _check_breakout_indicators(
+                    "put", cur_close, ts, levels,
+                    vwap, ema9, ema21, rsi_xd, params,
+                )
+                if sig is not None:
+                    return sig
 
         if try_reversal:
-            sig = _check_reversal(
-                prev_close, cur_close, ts, row, levels,
-                vwap, ema9, rsi_xd, rsi_intra, params,
-            )
-            if sig is not None:
-                return sig
-
-        prev_ts, prev_close = ts, cur_close
+            if reversal_call_scan:
+                sig = _check_reversal_indicators(
+                    "call", cur_close, ts, levels,
+                    vwap, ema9, rsi_xd, rsi_intra, params,
+                )
+                if sig is not None:
+                    return sig
+            elif reversal_put_scan:
+                sig = _check_reversal_indicators(
+                    "put", cur_close, ts, levels,
+                    vwap, ema9, rsi_xd, rsi_intra, params,
+                )
+                if sig is not None:
+                    return sig
 
     return None
 
 
-def _check_breakout(
-    prev_close, cur_close, ts, row, levels,
+def _check_breakout_indicators(
+    direction: str, cur_close: float, ts, levels,
     vwap, ema9, ema21, rsi_xd, params,
 ) -> Signal | None:
-    """Two consecutive closes outside OR. All filters must align."""
+    """Indicator alignment check for a breakout-direction scan."""
     vwap_now = _value_at(vwap, ts)
     ema9_now = _value_at(ema9, ts)
     ema21_now = _value_at(ema21, ts)
@@ -286,86 +336,56 @@ def _check_breakout(
     rsi_prev = _previous_5min_rsi_value(rsi_xd, ts)
     if None in (vwap_now, ema9_now, ema21_now, rsi_now):
         return None
-
-    # Recent-extreme skip
+    # Skip if the prior 5-min RSI bar was extreme
     if rsi_prev is not None and (
         rsi_prev > params.rsi_extreme_high or rsi_prev < params.rsi_extreme_low
     ):
         return None
 
-    # CALL breakout
-    if prev_close > levels.orh and cur_close > levels.orh:
-        if (cur_close > vwap_now and cur_close > ema9_now and cur_close > ema21_now
-                and rsi_now > params.rsi_long_thresh):
-            return Signal(
-                timestamp=ts, signal_type="breakout", direction="call",
-                spot=cur_close, orh=levels.orh, orl=levels.orl,
-                vwap=vwap_now, ema9=ema9_now, ema21=ema21_now,
-                rsi_cross_day=rsi_now, rsi_intraday=None,
-            )
+    if direction == "call":
+        if not (cur_close > vwap_now and cur_close > ema9_now and cur_close > ema21_now):
+            return None
+        if not (rsi_now > params.rsi_long_thresh):
+            return None
+    else:
+        if not (cur_close < vwap_now and cur_close < ema9_now and cur_close < ema21_now):
+            return None
+        if not (rsi_now < params.rsi_short_thresh):
+            return None
 
-    # PUT breakout
-    if prev_close < levels.orl and cur_close < levels.orl:
-        if (cur_close < vwap_now and cur_close < ema9_now and cur_close < ema21_now
-                and rsi_now < params.rsi_short_thresh):
-            return Signal(
-                timestamp=ts, signal_type="breakout", direction="put",
-                spot=cur_close, orh=levels.orh, orl=levels.orl,
-                vwap=vwap_now, ema9=ema9_now, ema21=ema21_now,
-                rsi_cross_day=rsi_now, rsi_intraday=None,
-            )
-
-    return None
+    return Signal(
+        timestamp=ts, signal_type="breakout", direction=direction,
+        spot=cur_close, orh=levels.orh, orl=levels.orl,
+        vwap=vwap_now, ema9=ema9_now, ema21=ema21_now,
+        rsi_cross_day=rsi_now, rsi_intraday=None,
+    )
 
 
-def _check_reversal(
-    prev_close, cur_close, ts, row, levels,
+def _check_reversal_indicators(
+    direction: str, cur_close: float, ts, levels,
     vwap, ema9, rsi_xd, rsi_intra, params,
 ) -> Signal | None:
-    """Prev close outside OR, current close back inside. Direction is determined
-    by which side was broken: dip below ORL then back in = CALL (mean reverting
-    up); spike above ORH then back in = PUT (mean reverting down)."""
-    curr_inside = levels.orl <= cur_close <= levels.orh
-    if not curr_inside:
-        return None
-
-    # Direction comes from the failed-break direction
-    if prev_close < levels.orl:
-        direction = "call"
-    elif prev_close > levels.orh:
-        direction = "put"
-    else:
-        return None  # previous bar wasn't outside OR
-
+    """Indicator alignment check for a reversal-direction scan."""
     vwap_now = _value_at(vwap, ts)
     ema9_now = _value_at(ema9, ts)
     rsi_xd_now = _value_at(rsi_xd, ts)
     rsi_intra_now = _value_at(rsi_intra, ts)
-    # ema21 is intentionally not required for reversals.
     if None in (vwap_now, ema9_now, rsi_xd_now, rsi_intra_now):
         return None
 
-    # VWAP + EMA9 must align with the direction we're taking
     if direction == "call":
         if not (cur_close > vwap_now and cur_close > ema9_now):
             return None
-    else:  # put
-        if not (cur_close < vwap_now and cur_close < ema9_now):
-            return None
-
-    if direction == "call":
-        # Both cross-day and intraday RSI > 50
         if not (rsi_xd_now > params.rsi_long_thresh and rsi_intra_now > params.rsi_long_thresh):
             return None
-        # Skip if cross-day RSI in dead-zone [60, 65]
         if params.reversal_call_skip_lo <= rsi_xd_now <= params.reversal_call_skip_hi:
             return None
-    else:  # put
+    else:
+        if not (cur_close < vwap_now and cur_close < ema9_now):
+            return None
         if not (rsi_xd_now < params.rsi_short_thresh and rsi_intra_now < params.rsi_short_thresh):
             return None
-        # No symmetric skip zone for puts per spec
 
-    # ema21 isn't required for reversals; report NaN in the signal record.
     return Signal(
         timestamp=ts, signal_type="reversal", direction=direction,
         spot=cur_close, orh=levels.orh, orl=levels.orl,
