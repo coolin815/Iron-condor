@@ -69,7 +69,7 @@ def _parse_rsi_thresh(s: str) -> tuple[float, float]:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="SPY 0DTE long iron condor backtester")
     p.add_argument("--smoke", action="store_true", help="Run a single recent day to verify wiring")
-    p.add_argument("--days", type=int, default=365, help="Lookback window in calendar days (default 365)")
+    p.add_argument("--days", type=int, default=30, help="Lookback window in calendar days (default 30; pass 365 for a full year)")
     p.add_argument("--start", type=_parse_date, help="Explicit start date YYYY-MM-DD")
     p.add_argument("--end", type=_parse_date, help="Explicit end date YYYY-MM-DD")
     p.add_argument("--sweep", action="store_true", help="Run a parameter sweep (default: single config)")
