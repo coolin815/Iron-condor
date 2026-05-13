@@ -47,7 +47,7 @@ class StrategyParams:
 
     # Account
     starting_balance: float = 1500.0
-    max_capital_per_trade: float = 20000.0
+    max_capital_per_trade: float = 50000.0
 
 
 # ---------------------------------------------------------------------------
