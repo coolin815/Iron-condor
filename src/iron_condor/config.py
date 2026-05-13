@@ -75,7 +75,7 @@ class StrategyParams:
 # ---------------------------------------------------------------------------
 
 
-RSI_PERIODS: tuple[int, ...] = (9, 14)
+RSI_PERIODS: tuple[int, ...] = (14,)  # 30-day sweep showed RSI 9 lost every config
 
 # Pairs of (overbought, oversold) thresholds to sweep.
 RSI_THRESHOLDS: tuple[tuple[float, float], ...] = (
@@ -99,8 +99,9 @@ ENTRY_CUTOFFS: tuple[time, ...] = (
     time(14, 0),
 )
 
-STRIKE_RULES: tuple[StrikeRule, ...] = (
-    # Fixed offsets from the brief: $1.50–$2 inner, $3–$4 wings.
+# Full catalog of every strike rule we have — used for CLI lookup by name.
+ALL_STRIKE_RULES: tuple[StrikeRule, ...] = (
+    # Fixed offsets from the brief.
     StrikeRule(mode="fixed", name="fixed_1.0x3", long_inner_offset=1.0, wing_width=3.0),
     StrikeRule(mode="fixed", name="fixed_1.5x3", long_inner_offset=1.5, wing_width=3.0),
     StrikeRule(mode="fixed", name="fixed_1.5x4", long_inner_offset=1.5, wing_width=4.0),
@@ -110,6 +111,10 @@ STRIKE_RULES: tuple[StrikeRule, ...] = (
     StrikeRule(mode="delta", name="delta_25_10", inner_delta=0.25, outer_delta=0.10),
     StrikeRule(mode="delta", name="delta_30_15", inner_delta=0.30, outer_delta=0.15),
 )
+
+# Default sweep — narrowed to the family that won every 30-day sweep so far.
+# Override via --strike on the CLI to broaden.
+STRIKE_RULES: tuple[StrikeRule, ...] = (ALL_STRIKE_RULES[0],)
 
 
 # ---------------------------------------------------------------------------

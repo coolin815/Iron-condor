@@ -28,6 +28,7 @@ import pandas as pd
 
 from .backtest import run_backtest, run_sweep, simulate_day
 from .config import (
+    ALL_STRIKE_RULES,
     ENTRY_CUTOFFS,
     PROFIT_TARGETS,
     RSI_PERIODS,
@@ -76,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Sweep dimension filters. Repeat the flag to include multiple values.
     p.add_argument("--rsi", type=int, action="append",
-                   help="Restrict sweep to these RSI periods (default: 9, 14). Repeatable.")
+                   help="Restrict sweep to these RSI periods (default: 14). Repeatable.")
     p.add_argument("--rsi-thresh", type=_parse_rsi_thresh, action="append",
                    help="Restrict to these RSI thresholds 'upper/lower' (e.g. 75/25). "
                         "Default: 70/30, 75/25, 80/20. Repeatable.")
@@ -132,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         entry_cutoffs = args.co or list(ENTRY_CUTOFFS)
         if args.strike:
             wanted = set(args.strike)
-            strike_rules = [r for r in STRIKE_RULES if r.name in wanted]
+            strike_rules = [r for r in ALL_STRIKE_RULES if r.name in wanted]
             missing = wanted - {r.name for r in strike_rules}
             if missing:
                 print(f"WARN: unknown strike rule(s) ignored: {missing}", file=sys.stderr)
