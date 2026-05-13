@@ -19,10 +19,14 @@ from tqdm import tqdm
 from .config import (
     CONFLUENCE_LEVELS,
     ENTRY_CUTOFFS,
+    MIN_BREAK_PCTS,
     OR_WINDOWS,
+    PREMARKET_BIASES,
     PROFIT_TARGETS,
     STOP_LOSSES,
     TIME_STOPS,
+    VOL_MULTS,
+    VWAP_FILTERS,
     ConfluenceLevel,
     StrategyParams,
     UNDERLYING,
@@ -44,6 +48,10 @@ class TradeResult:
     # signal config
     or_window_min: int
     confluence: str
+    min_break_pct: float
+    vol_mult: float
+    vwap_filter: bool
+    premarket_bias: bool
     profit_target: float
     stop_loss: float
     time_stop_min: int
@@ -140,6 +148,10 @@ def simulate_day(
         day=day,
         or_window_min=params.or_window_min,
         confluence=params.confluence,
+        min_break_pct=params.min_break_pct,
+        vol_mult=params.vol_mult,
+        vwap_filter=params.vwap_filter,
+        premarket_bias=params.premarket_bias,
         profit_target=params.profit_target_pct,
         stop_loss=params.stop_loss_pct,
         time_stop_min=params.time_stop_min,
@@ -304,6 +316,7 @@ def run_backtest(
     desc = (
         f"or{params.or_window_min}"
         f"|conf={params.confluence}"
+        f"|{_filter_tag(params.min_break_pct, params.vol_mult, params.vwap_filter, params.premarket_bias)}"
         f"|pt{int(params.profit_target_pct*100)}"
         f"|sl{int(params.stop_loss_pct*100)}"
         f"|ts{params.time_stop_min}"
@@ -316,6 +329,20 @@ def run_backtest(
     return pd.DataFrame([asdict(r) for r in results])
 
 
+def _filter_tag(mb: float, vm: float, vwap: bool, pmb: bool) -> str:
+    """Compact label for the filter tuple."""
+    parts = []
+    if mb > 0:
+        parts.append(f"mb{int(mb*10000)}bp")  # 0.001 -> "10bp"
+    if vm > 0:
+        parts.append(f"vol{vm:g}x")
+    if vwap:
+        parts.append("vwap")
+    if pmb:
+        parts.append("pmb")
+    return "|".join(parts) if parts else "nofilt"
+
+
 def run_sweep(
     start: date,
     end: date,
@@ -325,24 +352,32 @@ def run_sweep(
     stop_losses: Iterable[float] = STOP_LOSSES,
     time_stops: Iterable[int] = TIME_STOPS,
     entry_cutoffs=ENTRY_CUTOFFS,
+    min_break_pcts: Iterable[float] = MIN_BREAK_PCTS,
+    vol_mults: Iterable[float] = VOL_MULTS,
+    vwap_filters: Iterable[bool] = VWAP_FILTERS,
+    premarket_biases: Iterable[bool] = PREMARKET_BIASES,
     base_params: StrategyParams | None = None,
     client: PolygonClient | None = None,
 ) -> pd.DataFrame:
-    """Run every (or_window × confluence × pt × sl × time_stop × cutoff) combo."""
+    """Run every combination of all sweep dimensions including filters."""
     client = client or PolygonClient()
     base = base_params or StrategyParams()
     all_rows: list[pd.DataFrame] = []
 
     combos = [
-        (orw, cf, pt, sl, ts, co)
+        (orw, cf, pt, sl, ts, co, mb, vm, vwap, pmb)
         for orw in or_windows
         for cf in confluences
         for pt in profit_targets
         for sl in stop_losses
         for ts in time_stops
         for co in entry_cutoffs
+        for mb in min_break_pcts
+        for vm in vol_mults
+        for vwap in vwap_filters
+        for pmb in premarket_biases
     ]
-    for orw, cf, pt, sl, ts_min, co in combos:
+    for orw, cf, pt, sl, ts_min, co, mb, vm, vwap, pmb in combos:
         params = StrategyParams(
             or_window_min=orw,
             confluence=cf,
@@ -350,6 +385,10 @@ def run_sweep(
             latest_entry=co,
             time_stop_min=ts_min,
             hard_close=base.hard_close,
+            min_break_pct=mb,
+            vol_mult=vm,
+            vwap_filter=vwap,
+            premarket_bias=pmb,
             profit_target_pct=pt,
             stop_loss_pct=sl,
             commission_per_contract=base.commission_per_contract,
@@ -360,6 +399,7 @@ def run_sweep(
         df = run_backtest(params, start, end, client=client)
         df["config"] = (
             f"or{orw}|conf={cf}"
+            f"|{_filter_tag(mb, vm, vwap, pmb)}"
             f"|pt{int(pt*100)}|sl{int(sl*100)}|ts{ts_min}"
             f"|co{co.strftime('%H%M')}"
         )

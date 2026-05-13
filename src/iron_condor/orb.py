@@ -117,6 +117,123 @@ def compute_levels(
 
 
 # ---------------------------------------------------------------------------
+# Filter helpers
+# ---------------------------------------------------------------------------
+
+
+def _compute_vwap_up_to(bars: pd.DataFrame, end_ts: pd.Timestamp) -> float | None:
+    """Cumulative session VWAP from 9:30 ET up to and including `end_ts`.
+
+    Uses typical price ((H+L+C)/3) weighted by volume. Returns None if there's
+    no data in the window.
+    """
+    reg = _between_time(bars, time(9, 30), time(16, 0))
+    if reg.empty:
+        return None
+    idx = reg.index.tz_convert("America/New_York")
+    reg = reg.copy()
+    reg.index = idx
+    upto = reg[reg.index <= end_ts]
+    if upto.empty:
+        return None
+    typ = (upto["high"] + upto["low"] + upto["close"]) / 3.0
+    vol = upto["volume"].astype(float)
+    if vol.sum() == 0:
+        return float(typ.mean())
+    return float((typ * vol).sum() / vol.sum())
+
+
+def _premarket_trend(bars: pd.DataFrame) -> str | None:
+    """Return 'up' / 'down' / None based on premarket open vs close."""
+    pm = _between_time(bars, time(4, 0), time(9, 30))
+    if pm.empty:
+        return None
+    first_open = float(pm.iloc[0]["open"])
+    last_close = float(pm.iloc[-1]["close"])
+    if last_close > first_open:
+        return "up"
+    if last_close < first_open:
+        return "down"
+    return None
+
+
+def _trailing_volume_avg(
+    bars: pd.DataFrame, end_ts: pd.Timestamp, n: int = 20
+) -> float | None:
+    """Average regular-session volume over the n bars strictly before `end_ts`."""
+    reg = _between_time(bars, time(9, 30), time(16, 0))
+    if reg.empty:
+        return None
+    idx = reg.index.tz_convert("America/New_York")
+    reg = reg.copy()
+    reg.index = idx
+    prior = reg[reg.index < end_ts]
+    if prior.empty:
+        return None
+    tail = prior.tail(n)
+    if len(tail) == 0:
+        return None
+    avg = float(tail["volume"].mean())
+    if avg <= 0:
+        return None
+    return avg
+
+
+def _passes_filters(
+    bars: pd.DataFrame,
+    direction: str,
+    ts: pd.Timestamp,
+    bar: pd.Series,
+    levels: Levels,
+    params,
+) -> bool:
+    """True if all enabled filters pass on this candidate breakout bar."""
+    # Minimum break magnitude
+    if params.min_break_pct > 0:
+        if direction == "long":
+            if levels.orh is None:
+                return False
+            if (float(bar["high"]) - levels.orh) / levels.orh < params.min_break_pct:
+                return False
+        else:
+            if levels.orl is None:
+                return False
+            if (levels.orl - float(bar["low"])) / levels.orl < params.min_break_pct:
+                return False
+
+    # Volume confirmation
+    if params.vol_mult > 0:
+        avg = _trailing_volume_avg(bars, ts)
+        if avg is None:
+            return False
+        if float(bar.get("volume", 0)) < params.vol_mult * avg:
+            return False
+
+    # VWAP alignment
+    if params.vwap_filter:
+        vwap = _compute_vwap_up_to(bars, ts)
+        if vwap is None:
+            return False
+        close = float(bar["close"])
+        if direction == "long" and close <= vwap:
+            return False
+        if direction == "short" and close >= vwap:
+            return False
+
+    # Premarket bias
+    if params.premarket_bias:
+        pm = _premarket_trend(bars)
+        if pm is None:
+            return False
+        if direction == "long" and pm != "up":
+            return False
+        if direction == "short" and pm != "down":
+            return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Signal detection
 # ---------------------------------------------------------------------------
 
@@ -180,7 +297,8 @@ def find_orb_signal(
         lo = float(row["low"])
         cl = float(row["close"])
         if hi > levels.orh:
-            if _passes_confluence("long", hi, levels, params.confluence):
+            if _passes_confluence("long", hi, levels, params.confluence) and \
+               _passes_filters(today_bars, "long", ts, row, levels, params):
                 return ORBSignal(
                     timestamp=ts,
                     direction="long",
@@ -190,7 +308,8 @@ def find_orb_signal(
                     level_broken=_confluence_label("long", hi, levels),
                 )
         if lo < levels.orl:
-            if _passes_confluence("short", lo, levels, params.confluence):
+            if _passes_confluence("short", lo, levels, params.confluence) and \
+               _passes_filters(today_bars, "short", ts, row, levels, params):
                 return ORBSignal(
                     timestamp=ts,
                     direction="short",

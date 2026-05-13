@@ -104,6 +104,84 @@ def test_orb_signal_skipped_if_outside_window() -> None:
     assert sig is None
 
 
+def test_min_break_pct_blocks_weak_break() -> None:
+    """A break that barely clears ORH should be filtered out when min_break_pct > 0."""
+    today = _make_bars([
+        ("2026-05-12 09:30", 500, 502, 498, 500),   # ORH = 502
+        ("2026-05-12 09:34", 500, 502, 498, 500),
+        ("2026-05-12 09:51", 500, 502.10, 500, 502.05),  # break by 0.05 (~0.01%)
+    ])
+    levels = compute_levels(today, _make_bars([]), or_window_min=5)
+    # No filter -> signal
+    p_loose = StrategyParams(or_window_min=5)
+    assert find_orb_signal(today, levels, p_loose) is not None
+    # 0.05% required (~0.25 on 502) -> filtered
+    p_tight = StrategyParams(or_window_min=5, min_break_pct=0.0005)
+    assert find_orb_signal(today, levels, p_tight) is None
+
+
+def test_vol_mult_blocks_low_volume_break() -> None:
+    """Break-bar volume below threshold should fail the filter."""
+    rows = []
+    # Build OR bars with reference volume 1000
+    for i, t in enumerate(["09:30", "09:31", "09:32", "09:33", "09:34"]):
+        rows.append((f"2026-05-12 {t}", 500, 502, 498, 500))
+    # Quiet bars after OR (low vol baseline)
+    rows.extend([
+        ("2026-05-12 09:35", 500, 501, 499, 500),
+        ("2026-05-12 09:50", 500, 501, 499, 500),
+        ("2026-05-12 09:51", 500, 503, 501, 503),   # break, but we'll set its volume
+    ])
+    df = _make_bars(rows)
+    # Set volumes: baseline avg = 1000, breakout bar volume = 800 (below 1.5x)
+    df["volume"] = [1000] * (len(rows) - 1) + [800]
+    levels = compute_levels(df, _make_bars([]), or_window_min=5)
+    p = StrategyParams(or_window_min=5, vol_mult=1.5)
+    assert find_orb_signal(df, levels, p) is None
+    # If the breakout bar has 2000 volume (2x avg), it passes
+    df.loc[df.index[-1], "volume"] = 2000
+    assert find_orb_signal(df, levels, p) is not None
+
+
+def test_vwap_filter_blocks_long_when_close_below_vwap() -> None:
+    """Long signal must close above session VWAP. The break-bar itself has a
+    long upper wick + heavy volume that drives VWAP above its close."""
+    rows = [
+        ("2026-05-12 09:30", 500, 502, 498, 500),
+        ("2026-05-12 09:34", 500, 502, 498, 500),
+        # Break: high 510 > ORH=502 but close 502.5 below the bar's own
+        # typical (~504) which heavy volume pulls VWAP to ~503.5.
+        ("2026-05-12 09:51", 500, 510, 500, 502.5),
+    ]
+    df = _make_bars(rows)
+    df["volume"] = [1000, 1000, 10000]
+    levels = compute_levels(df, _make_bars([]), or_window_min=5)
+    # Loose signal fires (high 510 > ORH 502)
+    assert find_orb_signal(df, levels, StrategyParams(or_window_min=5)) is not None
+    # VWAP filter blocks: VWAP ~ 503.5 but close 502.5
+    p = StrategyParams(or_window_min=5, vwap_filter=True)
+    assert find_orb_signal(df, levels, p) is None
+
+
+def test_premarket_bias_blocks_long_when_premarket_down() -> None:
+    """With premarket_bias=True, long signal blocked if premarket trended down."""
+    today = _make_bars([
+        # Premarket: down trend (501 -> 499)
+        ("2026-05-12 06:00", 501, 501, 500, 500.5),
+        ("2026-05-12 09:00", 500, 500, 499, 499),
+        # Regular session
+        ("2026-05-12 09:30", 500, 502, 498, 500),
+        ("2026-05-12 09:34", 500, 502, 498, 500),
+        ("2026-05-12 09:51", 500, 503, 500, 503),
+    ])
+    levels = compute_levels(today, _make_bars([]), or_window_min=5)
+    p = StrategyParams(or_window_min=5, premarket_bias=True)
+    assert find_orb_signal(today, levels, p) is None
+    # Without filter, signal would fire
+    p_loose = StrategyParams(or_window_min=5)
+    assert find_orb_signal(today, levels, p_loose) is not None
+
+
 def test_orb_confluence_pdh_blocks_weak_breaks() -> None:
     """Long break must clear PDH=510 for confluence='any' to pass."""
     yest = _make_bars([

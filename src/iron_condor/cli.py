@@ -30,10 +30,14 @@ from .backtest import run_backtest, run_sweep, simulate_day
 from .config import (
     CONFLUENCE_LEVELS,
     ENTRY_CUTOFFS,
+    MIN_BREAK_PCTS,
     OR_WINDOWS,
+    PREMARKET_BIASES,
     PROFIT_TARGETS,
     STOP_LOSSES,
     TIME_STOPS,
+    VOL_MULTS,
+    VWAP_FILTERS,
     StrategyParams,
 )
 from .metrics import summarize_run, summarize_sweep
@@ -68,6 +72,17 @@ def _parse_confluence(s: str) -> str:
     return s
 
 
+def _parse_yes_no(s: str) -> bool:
+    s = s.lower()
+    if s in ("yes", "y", "true", "on", "1"):
+        return True
+    if s in ("no", "n", "false", "off", "0"):
+        return False
+    raise argparse.ArgumentTypeError(
+        f"invalid yes/no value {s!r}; use yes/no"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="SPY 0DTE Opening Range Breakout backtester")
     p.add_argument("--smoke", action="store_true", help="Run a single recent day to verify wiring")
@@ -90,6 +105,18 @@ def main(argv: list[str] | None = None) -> int:
                    help=f"Time stops in minutes. Default: {list(TIME_STOPS)}.")
     p.add_argument("--co", type=_parse_time, action="append",
                    help="Entry cutoffs HH:MM ET (e.g. 11:00). Repeatable.")
+
+    # Filter sweep dimensions. Repeatable to sweep multiple values.
+    p.add_argument("--min-break", type=float, action="append",
+                   help="Min break magnitude as fraction past ORH/ORL (e.g. 0.001 = 10bp). "
+                        "Default: 0 (no filter). Repeatable.")
+    p.add_argument("--vol-mult", type=float, action="append",
+                   help="Require break-bar volume >= N * 20-bar avg (e.g. 1.5). "
+                        "Default: 0 (no filter). Repeatable.")
+    p.add_argument("--vwap", type=_parse_yes_no, action="append",
+                   help="VWAP-alignment filter (yes/no). Default: no. Repeatable to sweep both.")
+    p.add_argument("--pm-bias", type=_parse_yes_no, action="append",
+                   help="Premarket-direction filter (yes/no). Default: no. Repeatable.")
 
     args = p.parse_args(argv)
     _setup_logging(args.verbose)
@@ -133,17 +160,25 @@ def main(argv: list[str] | None = None) -> int:
         stop_losses = args.sl or list(STOP_LOSSES)
         time_stops = args.time_stop or list(TIME_STOPS)
         entry_cutoffs = args.co or list(ENTRY_CUTOFFS)
+        min_break_pcts = args.min_break or list(MIN_BREAK_PCTS)
+        vol_mults = args.vol_mult or list(VOL_MULTS)
+        vwap_filters = args.vwap or list(VWAP_FILTERS)
+        premarket_biases = args.pm_bias or list(PREMARKET_BIASES)
 
         n = (
             len(or_windows) * len(confluences) * len(profit_targets)
             * len(stop_losses) * len(time_stops) * len(entry_cutoffs)
+            * len(min_break_pcts) * len(vol_mults)
+            * len(vwap_filters) * len(premarket_biases)
         )
         print(
             f"Sweep: {n} configs "
             f"(or={or_windows}, conf={confluences}, "
             f"pt={profit_targets}, sl={stop_losses}, "
             f"ts={time_stops}, "
-            f"co={[c.isoformat(timespec='minutes') for c in entry_cutoffs]})"
+            f"co={[c.isoformat(timespec='minutes') for c in entry_cutoffs]}, "
+            f"min_break={min_break_pcts}, vol_mult={vol_mults}, "
+            f"vwap={vwap_filters}, pm_bias={premarket_biases})"
         )
 
         sweep_df = run_sweep(
@@ -154,6 +189,10 @@ def main(argv: list[str] | None = None) -> int:
             stop_losses=stop_losses,
             time_stops=time_stops,
             entry_cutoffs=entry_cutoffs,
+            min_break_pcts=min_break_pcts,
+            vol_mults=vol_mults,
+            vwap_filters=vwap_filters,
+            premarket_biases=premarket_biases,
             client=client,
         )
         sweep_df.to_csv(RESULTS_DIR / "sweep_trades.csv", index=False)
