@@ -80,6 +80,7 @@ RSI_PERIODS: tuple[int, ...] = (9, 14)
 # Pairs of (overbought, oversold) thresholds to sweep.
 RSI_THRESHOLDS: tuple[tuple[float, float], ...] = (
     (70.0, 30.0),   # default — most signals (fires ~95% of days)
+    (73.0, 27.0),   # slightly tighter
     (75.0, 25.0),   # tighter
     (80.0, 20.0),   # only strong extremes
 )
