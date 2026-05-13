@@ -399,12 +399,19 @@ def find_signal(
     if len(timestamps) < 3:
         return None
 
+    bar_minutes = params.bar_timeframe_min
+
     for i in range(2, len(timestamps)):
         ts = timestamps[i]
-        ts_time = ts.time()
-        if ts_time < params.earliest_entry:
+        # The 5-min bar labeled `ts` covers [ts, ts + bar_minutes). The bar's
+        # close + indicator values are not knowable in real life until that
+        # END timestamp — so the signal fires at `ts + bar_minutes`. Entering
+        # at the bar's start would be lookahead bias.
+        signal_ts = ts + pd.Timedelta(minutes=bar_minutes)
+        signal_time = signal_ts.time()
+        if signal_time < params.earliest_entry:
             continue
-        if ts_time > params.latest_entry:
+        if signal_time > params.latest_entry:
             break
 
         c1 = bars.iloc[i - 2]
@@ -415,7 +422,8 @@ def find_signal(
             continue
         pattern_name, direction = match
 
-        # Confirmations on this bar's close
+        # Confirmations on this bar's close (indicator values at the 5-min
+        # bar's left-label include the full bar by construction)
         close = float(c3["close"])
         vwap_now = _vwap_at(vwap, ts)
         ema9_now = float(ema9.loc[ts]) if ts in ema9.index and pd.notna(ema9.loc[ts]) else None
@@ -428,7 +436,7 @@ def find_signal(
             continue
 
         return Signal(
-            timestamp=ts,
+            timestamp=signal_ts,        # bar END, not start
             pattern=pattern_name,
             direction=direction,
             spot=close,
