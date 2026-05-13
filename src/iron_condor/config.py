@@ -77,6 +77,13 @@ class StrategyParams:
 
 RSI_PERIODS: tuple[int, ...] = (9, 14)
 
+# Pairs of (overbought, oversold) thresholds to sweep.
+RSI_THRESHOLDS: tuple[tuple[float, float], ...] = (
+    (70.0, 30.0),   # default — most signals (fires ~95% of days)
+    (75.0, 25.0),   # tighter
+    (80.0, 20.0),   # only strong extremes
+)
+
 PROFIT_TARGETS: tuple[float, ...] = (0.10, 0.15, 0.20, 0.25, 0.30)
 
 STOP_LOSSES: tuple[float, ...] = (0.25, 0.35, 0.50)

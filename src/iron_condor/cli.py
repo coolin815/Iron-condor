@@ -30,6 +30,7 @@ from .config import (
     ENTRY_CUTOFFS,
     PROFIT_TARGETS,
     RSI_PERIODS,
+    RSI_THRESHOLDS,
     STOP_LOSSES,
     STRIKE_RULES,
     StrategyParams,
@@ -57,6 +58,12 @@ def _parse_time(s: str) -> time:
     return time.fromisoformat(s)
 
 
+def _parse_rsi_thresh(s: str) -> tuple[float, float]:
+    """Parse 'upper/lower' like '75/25' into a (upper, lower) tuple."""
+    up_s, lo_s = s.split("/", 1)
+    return (float(up_s), float(lo_s))
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="SPY 0DTE long iron condor backtester")
     p.add_argument("--smoke", action="store_true", help="Run a single recent day to verify wiring")
@@ -69,6 +76,9 @@ def main(argv: list[str] | None = None) -> int:
     # Sweep dimension filters. Repeat the flag to include multiple values.
     p.add_argument("--rsi", type=int, action="append",
                    help="Restrict sweep to these RSI periods (default: 9, 14). Repeatable.")
+    p.add_argument("--rsi-thresh", type=_parse_rsi_thresh, action="append",
+                   help="Restrict to these RSI thresholds 'upper/lower' (e.g. 75/25). "
+                        "Default: 70/30, 75/25, 80/20. Repeatable.")
     p.add_argument("--strike", action="append",
                    help="Restrict to these strike-rule names. e.g. fixed_1.0x3. Repeatable.")
     p.add_argument("--pt", type=float, action="append",
@@ -110,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.sweep:
         # Apply filters; missing flag means "use all defaults".
         rsi_periods = args.rsi or list(RSI_PERIODS)
+        rsi_thresholds = args.rsi_thresh or list(RSI_THRESHOLDS)
         profit_targets = args.pt or list(PROFIT_TARGETS)
         stop_losses = args.sl or list(STOP_LOSSES)
         entry_cutoffs = args.co or list(ENTRY_CUTOFFS)
@@ -123,12 +134,13 @@ def main(argv: list[str] | None = None) -> int:
             strike_rules = list(STRIKE_RULES)
 
         n = (
-            len(rsi_periods) * len(strike_rules) * len(profit_targets)
-            * len(stop_losses) * len(entry_cutoffs)
+            len(rsi_periods) * len(rsi_thresholds) * len(strike_rules)
+            * len(profit_targets) * len(stop_losses) * len(entry_cutoffs)
         )
         print(
             f"Sweep: {n} configs "
-            f"(rsi={rsi_periods}, strikes={[r.name for r in strike_rules]}, "
+            f"(rsi={rsi_periods}, thresh={[f'{int(u)}/{int(l)}' for u,l in rsi_thresholds]}, "
+            f"strikes={[r.name for r in strike_rules]}, "
             f"pt={profit_targets}, sl={stop_losses}, "
             f"co={[c.isoformat(timespec='minutes') for c in entry_cutoffs]})"
         )
@@ -136,6 +148,7 @@ def main(argv: list[str] | None = None) -> int:
         sweep_df = run_sweep(
             start, end,
             rsi_periods=rsi_periods,
+            rsi_thresholds=rsi_thresholds,
             strike_rules=strike_rules,
             profit_targets=profit_targets,
             stop_losses=stop_losses,

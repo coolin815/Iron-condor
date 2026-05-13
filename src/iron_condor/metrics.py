@@ -5,6 +5,37 @@ import numpy as np
 import pandas as pd
 
 
+def analyze_timing(trades: pd.DataFrame) -> pd.DataFrame:
+    """Distribution of time-from-signal-to-exit per exit reason.
+
+    Use this to set an early time-stop that doesn't kill winners. Returns one
+    row per exit_reason with mean / median / quartile minutes_held.
+    """
+    df = trades[trades["exit_reason"].isin(["profit", "stop", "time_stop"])].copy()
+    if df.empty:
+        return pd.DataFrame()
+    # Compute on the fly if minutes_held wasn't materialized (older runs).
+    if "minutes_held" not in df.columns or df["minutes_held"].isna().all():
+        df["signal_time"] = pd.to_datetime(df["signal_time"])
+        df["exit_time"] = pd.to_datetime(df["exit_time"])
+        df["minutes_held"] = (
+            df["exit_time"] - df["signal_time"]
+        ).dt.total_seconds() / 60.0
+    return (
+        df.groupby("exit_reason")["minutes_held"]
+        .agg(
+            count="count",
+            mean="mean",
+            p25=lambda s: s.quantile(0.25),
+            median="median",
+            p75=lambda s: s.quantile(0.75),
+            p90=lambda s: s.quantile(0.90),
+            max="max",
+        )
+        .round(1)
+    )
+
+
 def summarize_run(trades: pd.DataFrame, starting_balance: float) -> dict:
     """Compute a per-run summary dict from a trade-log DataFrame."""
     taken = trades[trades["exit_reason"].isin(["profit", "stop", "time_stop"])]

@@ -15,6 +15,7 @@ from .config import (
     ENTRY_CUTOFFS,
     PROFIT_TARGETS,
     RSI_PERIODS,
+    RSI_THRESHOLDS,
     STOP_LOSSES,
     STRIKE_RULES,
     StrategyParams,
@@ -36,6 +37,8 @@ log = logging.getLogger(__name__)
 class TradeResult:
     day: date
     rsi_period: int
+    rsi_upper: float
+    rsi_lower: float
     strike_rule: str
     profit_target: float
     stop_loss: float
@@ -51,6 +54,7 @@ class TradeResult:
     entry_debit: float | None     # paid at ask-side combo on entry
     exit_credit: float | None     # received at bid-side combo on exit
     exit_time: datetime | None
+    minutes_held: float | None    # minutes from signal_time to exit_time
     exit_reason: str          # 'no_signal', 'no_data', 'profit', 'stop', 'time_stop'
     gross_pnl: float
     fees: float
@@ -155,6 +159,8 @@ def simulate_day(
     base = TradeResult(
         day=day,
         rsi_period=params.rsi_period,
+        rsi_upper=params.rsi_upper,
+        rsi_lower=params.rsi_lower,
         strike_rule=params.strike_rule.name,
         profit_target=params.profit_target_pct,
         stop_loss=params.stop_loss_pct,
@@ -170,6 +176,7 @@ def simulate_day(
         entry_debit=None,
         exit_credit=None,
         exit_time=None,
+        minutes_held=None,
         exit_reason="no_signal",
         gross_pnl=0.0,
         fees=0.0,
@@ -278,6 +285,7 @@ def simulate_day(
     base.exit_time = exit_ts.to_pydatetime()
     base.exit_credit = exit_credit
     base.exit_reason = exit_reason
+    base.minutes_held = (exit_ts - entry_ts).total_seconds() / 60.0
     base.gross_pnl = gross
     base.fees = fees
     base.net_pnl = net
@@ -302,7 +310,8 @@ def run_backtest(
     balance = params.starting_balance
     results: list[TradeResult] = []
     desc = (
-        f"{params.strike_rule.name}|rsi{params.rsi_period}"
+        f"{params.strike_rule.name}"
+        f"|rsi{params.rsi_period}_{int(params.rsi_upper)}-{int(params.rsi_lower)}"
         f"|pt{int(params.profit_target_pct*100)}"
         f"|sl{int(params.stop_loss_pct*100)}"
         f"|co{params.latest_entry.strftime('%H%M')}"
@@ -318,6 +327,7 @@ def run_sweep(
     start: date,
     end: date,
     rsi_periods: Iterable[int] = RSI_PERIODS,
+    rsi_thresholds: Iterable[tuple[float, float]] = RSI_THRESHOLDS,
     strike_rules: Iterable[StrikeRule] = STRIKE_RULES,
     profit_targets: Iterable[float] = PROFIT_TARGETS,
     stop_losses: Iterable[float] = STOP_LOSSES,
@@ -325,7 +335,7 @@ def run_sweep(
     base_params: StrategyParams | None = None,
     client: PolygonClient | None = None,
 ) -> pd.DataFrame:
-    """Run every (rsi × strike_rule × profit_target × stop_loss × entry_cutoff) combo.
+    """Run every (rsi period × rsi threshold × strike × pt × sl × cutoff) combo.
 
     Returns a single DataFrame with a 'config' column distinguishing runs.
     """
@@ -334,18 +344,19 @@ def run_sweep(
     all_rows: list[pd.DataFrame] = []
 
     combos = [
-        (rp, sr, pt, sl, co)
+        (rp, thr, sr, pt, sl, co)
         for rp in rsi_periods
+        for thr in rsi_thresholds
         for sr in strike_rules
         for pt in profit_targets
         for sl in stop_losses
         for co in entry_cutoffs
     ]
-    for rp, sr, pt, sl, co in combos:
+    for rp, (up, lo), sr, pt, sl, co in combos:
         params = StrategyParams(
             rsi_period=rp,
-            rsi_upper=base.rsi_upper,
-            rsi_lower=base.rsi_lower,
+            rsi_upper=up,
+            rsi_lower=lo,
             earliest_entry=base.earliest_entry,
             latest_entry=co,
             time_stop=base.time_stop,
@@ -360,7 +371,8 @@ def run_sweep(
         )
         df = run_backtest(params, start, end, client=client)
         df["config"] = (
-            f"{sr.name}|rsi{rp}|pt{int(pt*100)}|sl{int(sl*100)}|co{co.strftime('%H%M')}"
+            f"{sr.name}|rsi{rp}_{int(up)}-{int(lo)}"
+            f"|pt{int(pt*100)}|sl{int(sl*100)}|co{co.strftime('%H%M')}"
         )
         all_rows.append(df)
     return pd.concat(all_rows, ignore_index=True)
