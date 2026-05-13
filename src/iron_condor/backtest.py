@@ -7,7 +7,6 @@ from datetime import date, datetime, timedelta
 from math import floor
 from typing import Iterable
 
-import exchange_calendars as xcals
 import pandas as pd
 from tqdm import tqdm
 
@@ -68,11 +67,13 @@ class TradeResult:
 
 
 def _trading_days(start: date, end: date) -> list[date]:
-    cal = xcals.get_calendar("XNYS")
-    sessions = cal.sessions_in_range(
-        pd.Timestamp(start), pd.Timestamp(end)
-    )
-    return [d.date() for d in sessions]
+    """Business days (Mon-Fri) in [start, end].
+
+    NYSE holidays return empty bars from Polygon, which simulate_day treats
+    as 'no_data' and skips — so we don't need an exchange calendar to
+    pre-filter them out.
+    """
+    return [d.date() for d in pd.bdate_range(start, end)]
 
 
 def _reindex_minute_bars(
