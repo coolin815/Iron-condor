@@ -302,13 +302,72 @@ class PolygonClient:
         return df
 
     # ------------------------------------------------------------------
-    # Batch helper
+    # Options: tick-by-tick trades for one contract on one day
     # ------------------------------------------------------------------
 
-    def fetch_many_option_bars(
-        self, tickers: Iterable[str], day: date
-    ) -> dict[str, pd.DataFrame]:
-        return {t: self.get_option_minute_bars(t, day) for t in tickers}
+    def get_option_trades(
+        self, option_ticker: str, day: date, force: bool = False
+    ) -> pd.DataFrame:
+        """All trade prints for an option contract on a single calendar day.
+
+        Returns a DataFrame with columns [sip_timestamp_ns, price, size,
+        exchange, conditions] sorted ascending by sip_timestamp_ns. Empty
+        frame if no trades or no permission.
+        """
+        cache = self._cache_path(
+            f"opt_trades/{option_ticker}", day.isoformat(), "parquet"
+        )
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        if cache.exists() and not force:
+            return pd.read_parquet(cache)
+
+        # Trades endpoint expects timestamps in nanoseconds or RFC3339.
+        # Use UTC ISO date to cover the full calendar day.
+        start_iso = f"{day.isoformat()}T00:00:00Z"
+        end_iso = f"{day.isoformat()}T23:59:59Z"
+        path = f"/v3/trades/{option_ticker}"
+        params = {
+            "timestamp.gte": start_iso,
+            "timestamp.lte": end_iso,
+            "order": "asc",
+            "sort": "timestamp",
+            "limit": 50000,
+        }
+        try:
+            results = self._paginate(path, params)
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 403:
+                log.warning(
+                    "Polygon 403 trades %s on %s — no permission; skipping",
+                    option_ticker, day,
+                )
+                return pd.DataFrame(
+                    columns=["sip_timestamp_ns", "price", "size", "exchange", "conditions"]
+                )
+            raise
+        if not results:
+            df = pd.DataFrame(
+                columns=["sip_timestamp_ns", "price", "size", "exchange", "conditions"]
+            )
+        else:
+            df = pd.DataFrame(results)
+            # Polygon's trade objects use "sip_timestamp" (nanoseconds) and
+            # "price"/"size"/"exchange"/"conditions" (list). Standardize.
+            keep = {
+                "sip_timestamp": "sip_timestamp_ns",
+                "price": "price",
+                "size": "size",
+                "exchange": "exchange",
+                "conditions": "conditions",
+            }
+            df = df.rename(columns=keep)
+            cols = [c for c in keep.values() if c in df.columns]
+            df = df[cols]
+            # Conditions is a list[int]; coerce to string for parquet stability.
+            if "conditions" in df.columns:
+                df["conditions"] = df["conditions"].astype(str)
+        df.to_parquet(cache)
+        return df
 
 
 # ---------------------------------------------------------------------------

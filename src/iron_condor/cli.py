@@ -1,4 +1,10 @@
-"""Backtest CLI for the SPY 0DTE credit-spread strategy."""
+"""Backtest CLI for the SPY 0DTE flow-following strategy.
+
+Examples:
+    python -m iron_condor.cli --smoke
+    python -m iron_condor.cli --days 365 --sweep
+    python -m iron_condor.cli --sweep --size-threshold 1500 --pt 0.30
+"""
 from __future__ import annotations
 
 import argparse
@@ -11,7 +17,13 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from .backtest import run_backtest, run_sweep, simulate_day
-from .config import PROFIT_TARGETS, STOP_LOSSES, TIME_STOPS, StrategyParams
+from .config import (
+    PROFIT_TARGETS,
+    SIZE_THRESHOLDS,
+    STOP_LOSSES,
+    TIME_STOPS,
+    StrategyParams,
+)
 from .metrics import summarize_run, summarize_sweep
 from .polygon_client import PolygonClient
 
@@ -45,7 +57,7 @@ def _parse_pnl_mode(s: str) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
-        description="SPY 0DTE Credit-Spread backtester (ORB-direction)"
+        description="SPY 0DTE flow-following backtester (large-print copy)"
     )
     p.add_argument("--smoke", action="store_true")
     p.add_argument("--days", type=int, default=30)
@@ -53,23 +65,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--end", type=_parse_date)
     p.add_argument("--sweep", action="store_true")
     p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument("--size-threshold", type=int, action="append",
+                   help=f"Minimum print size to copy (contracts). "
+                        f"Default sweep: {list(SIZE_THRESHOLDS)}. Repeatable.")
     p.add_argument("--pt", type=float, action="append",
-                   help=f"Profit target as fraction of credit captured (e.g. 0.50 = take 50%% "
-                        f"of the credit). Default: {list(PROFIT_TARGETS)}. Repeatable.")
+                   help=f"Profit target as fraction of option price (e.g. 0.30). "
+                        f"Default: {list(PROFIT_TARGETS)}. Repeatable.")
     p.add_argument("--sl", type=float, action="append",
-                   help=f"Stop loss as fraction of credit given back (e.g. 0.30 = stop when "
-                        f"30%% of the credit has been lost). Default: {list(STOP_LOSSES)}. "
-                        "Repeatable.")
+                   help=f"Stop loss as fraction. Default: {list(STOP_LOSSES)}. Repeatable.")
     p.add_argument("--time-stop", type=int, action="append",
                    help=f"Time stops in minutes. Default: {list(TIME_STOPS)}. Repeatable.")
     p.add_argument("--pnl-mode", type=_parse_pnl_mode, action="append",
-                   help="P&L mode: gross (mid-to-mid) or net (after fills). Default: gross. Repeatable.")
-    p.add_argument("--short-offset", type=float, action="append",
-                   help="Distance in $ from spot to short strike. Default: 1.0. Repeatable to sweep.")
-    p.add_argument("--spread-width", type=float, default=None,
-                   help="Distance between short and long strike in $. Default: 1.0.")
-    p.add_argument("--direction", choices=["continuation", "reversion"], action="append",
-                   help="ORB direction interpretation. Default: reversion. Repeatable to sweep both.")
+                   help="P&L mode: gross (mid-to-mid) or net (after fills). Default: gross.")
+    p.add_argument("--strike-window", type=float, default=None,
+                   help="Half-width $ around opening spot for scanned strikes. Default: 5.0.")
     p.add_argument("--include-fridays", action="store_true",
                    help="Override the default Friday-skip rule.")
 
@@ -80,11 +89,11 @@ def main(argv: list[str] | None = None) -> int:
     client = PolygonClient()
 
     overrides = {"skip_fridays": not args.include_fridays}
-    if args.spread_width is not None:
-        overrides["spread_width"] = args.spread_width
-    # If short-offset is given for the smoke / single-config path, take the first
-    if args.short_offset:
-        overrides["short_strike_offset"] = args.short_offset[0]
+    if args.strike_window is not None:
+        overrides["strike_window"] = args.strike_window
+    # For smoke / single-config use first size threshold passed if any
+    if args.size_threshold:
+        overrides["size_threshold"] = args.size_threshold[0]
     base_params = StrategyParams(**overrides)
 
     if args.smoke:
@@ -101,9 +110,8 @@ def main(argv: list[str] | None = None) -> int:
         if target is None:
             target = days[-1] if days else end
         print(
-            f"Smoke test on {target} — credit spread, "
-            f"short_offset={base_params.short_strike_offset}, "
-            f"width={base_params.spread_width}, "
+            f"Smoke test on {target} — size_threshold={base_params.size_threshold}, "
+            f"strike_window=±${base_params.strike_window}, "
             f"pt={base_params.profit_target_pct:.0%}, sl={base_params.stop_loss_pct:.0%}"
         )
         result = simulate_day(target, base_params, base_params.starting_balance, client)
@@ -119,30 +127,26 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Backtest window: {start} -> {end}")
 
     if args.sweep:
+        size_thresholds = args.size_threshold or list(SIZE_THRESHOLDS)
         pts = args.pt or list(PROFIT_TARGETS)
         sls = args.sl or list(STOP_LOSSES)
         time_stops = args.time_stop or list(TIME_STOPS)
         pnl_modes = args.pnl_mode or [base_params.pnl_mode]
-        short_offsets = args.short_offset or [base_params.short_strike_offset]
-        directions = args.direction or [base_params.direction_mode]
-        n = (len(pts) * len(sls) * len(time_stops) * len(pnl_modes)
-             * len(short_offsets) * len(directions))
+        n = (len(size_thresholds) * len(pts) * len(sls)
+             * len(time_stops) * len(pnl_modes))
         print(
-            f"Sweep: {n} configs (pt={pts}, sl={sls}, ts={time_stops}, "
-            f"pnl={pnl_modes}, short_offset={short_offsets}, "
-            f"direction={directions}, "
-            f"width={base_params.spread_width}, "
-            f"skip_fridays={base_params.skip_fridays})"
+            f"Sweep: {n} configs (size_threshold={size_thresholds}, "
+            f"pt={pts}, sl={sls}, ts={time_stops}, pnl={pnl_modes}, "
+            f"strike_window=±${base_params.strike_window})"
         )
 
         sweep_df = run_sweep(
             start, end,
+            size_thresholds=size_thresholds,
             profit_targets=pts,
             stop_losses=sls,
             time_stops=time_stops,
             pnl_modes=pnl_modes,
-            short_offsets=short_offsets,
-            direction_modes=directions,
             base_params=base_params,
             client=client,
         )

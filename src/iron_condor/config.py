@@ -1,6 +1,6 @@
-"""Strategy parameters for the SPY 0DTE credit-spread strategy.
+"""Strategy parameters for the SPY 0DTE 'follow the flow' strategy.
 
-ORB-direction credit spreads. Single trade/day, no Fridays.
+Copies large BUY-aggressor option prints. Single trade/day, no Fridays.
 """
 from __future__ import annotations
 
@@ -10,47 +10,40 @@ from typing import Literal
 
 UNDERLYING: str = "SPY"
 
-DirectionMode = Literal["continuation", "reversion"]
-
 
 @dataclass(frozen=True)
 class StrategyParams:
     # Signal
-    or_window_min: int = 30                # opening range = first 30 min
-    earliest_entry: time = time(10, 0)     # immediately after OR closes
-    latest_entry: time = time(13, 0)       # 10:00 AM PT
-    time_stop_min: int = 60                # cap holding period
+    earliest_entry: time = time(9, 35)     # right after the open
+    latest_entry: time = time(15, 0)       # 12:00 PT — no new entries this late
+    time_stop_min: int = 30
     hard_close: time = time(15, 55)
     skip_fridays: bool = True
 
-    # ORB direction interpretation:
-    #   "continuation" — break above ORH -> bull put; below ORL -> bear call
-    #   "reversion"   — break above ORH -> bear call; below ORL -> bull put
-    direction_mode: DirectionMode = "reversion"
+    # Flow-detection threshold (single print size in contracts)
+    size_threshold: int = 1500
 
-    # Strike selection (per spread)
-    short_strike_offset: float = 1.0       # short strike $X OTM from spot
-    spread_width: float = 1.0              # long strike $X further OTM
+    # Strike scope: only look at contracts within ±this many dollars of spot
+    strike_window: float = 5.0
 
-    # P&L measurement: "gross" (mid-to-mid spread value) or "net" (after fills)
+    # P&L measurement: "gross" (option mid-to-mid) or "net" (after fills)
     pnl_mode: Literal["gross", "net"] = "gross"
 
-    # Exits (as fraction of CREDIT COLLECTED, TastyTrade-style):
-    #   PT X% -> exit when spread value <= (1 - X) * entry_credit
-    #   SL X% -> exit when spread value >= (1 + X) * entry_credit
-    profit_target_pct: float = 0.50
-    stop_loss_pct: float = 0.30
+    # Exits on the option price (since we're long a single leg again):
+    profit_target_pct: float = 0.30    # +30% on option mid
+    stop_loss_pct: float = 0.30        # -30% on option mid
 
     # Execution
     commission_per_contract: float = 0.85
-    leg_half_spread: float = 0.005
+    leg_half_spread: float = 0.01      # single-leg ATM bid-ask half
 
     # Account
     starting_balance: float = 1500.0
     max_capital_per_trade: float = 50000.0
 
 
-# Sweep grids (per the user's spec)
-PROFIT_TARGETS: tuple[float, ...] = (0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50)
-STOP_LOSSES: tuple[float, ...] = (0.10, 0.20, 0.30)
-TIME_STOPS: tuple[int, ...] = (30, 60, 120)
+# Sweep grids
+SIZE_THRESHOLDS: tuple[int, ...] = (1000, 1500, 2000, 2500)
+PROFIT_TARGETS: tuple[float, ...] = (0.20, 0.30, 0.50, 1.00)
+STOP_LOSSES: tuple[float, ...] = (0.20, 0.30, 0.50)
+TIME_STOPS: tuple[int, ...] = (15, 30, 60)
