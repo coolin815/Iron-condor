@@ -214,7 +214,7 @@ def simulate_day(
             continue
         bid = mid - h
         if use_gross:
-            exit_pct = (mid - entry_open) / entry_open
+            exit_pct = (mid - entry_mid) / entry_mid
         else:
             gross = (bid - entry_ask) * 100 * qty
             fees = 2 * params.commission_per_contract * qty
