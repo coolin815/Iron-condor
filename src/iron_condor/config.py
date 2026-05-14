@@ -1,7 +1,6 @@
-"""Strategy parameters for the SPY 0DTE candle-pattern strategy.
+"""Strategy parameters for the SPY 0DTE credit-spread strategy.
 
-Scans 10 candle patterns on 5-min bars in parallel; first to fire (with all
-indicator confirmations aligned) wins. One trade per day, no Fridays.
+ORB-direction credit spreads. Single trade/day, no Fridays.
 """
 from __future__ import annotations
 
@@ -11,44 +10,27 @@ from typing import Literal
 
 UNDERLYING: str = "SPY"
 
-# The 10 patterns we scan, in priority order (first match wins on a tie).
-PATTERN_NAMES: tuple[str, ...] = (
-    "three_white_soldiers",
-    "three_black_crows",
-    "morning_star",
-    "evening_star",
-    "bullish_engulfing",
-    "bearish_engulfing",
-    "hammer",
-    "shooting_star",
-    "piercing",
-    "dark_cloud",
-)
-
 
 @dataclass(frozen=True)
 class StrategyParams:
-    # Signal config
-    bar_timeframe_min: int = 5             # detection timeframe
-    earliest_entry: time = time(9, 45)     # need at least 3 5-min bars before entry
-    latest_entry: time = time(13, 0)       # 10 AM PT — no new trades after this
+    # Signal
+    or_window_min: int = 30                # opening range = first 30 min
+    earliest_entry: time = time(10, 0)     # immediately after OR closes
+    latest_entry: time = time(13, 0)       # 10:00 AM PT
     time_stop_min: int = 60                # cap holding period
-    hard_close: time = time(15, 55)        # safety net
-
-    # Confirmation indicator thresholds
-    rsi_long_thresh: float = 50.0
-    rsi_short_thresh: float = 50.0
+    hard_close: time = time(15, 55)
     skip_fridays: bool = True
 
-    # Which patterns to scan. Default = all 10. CLI can narrow via --pattern.
-    enabled_patterns: tuple[str, ...] = PATTERN_NAMES
+    # Strike selection (per spread)
+    short_strike_offset: float = 1.0       # short strike $X OTM from spot
+    spread_width: float = 1.0              # long strike $X further OTM
 
-    # P&L measurement: "gross" (option mid-to-mid) or "net" (after fees)
+    # P&L measurement: "gross" (mid-to-mid spread value) or "net" (after fills)
     pnl_mode: Literal["gross", "net"] = "gross"
 
-    # Exits
-    profit_target_pct: float = 0.10
-    stop_loss_pct: float = 0.20
+    # Exits (as fraction of capital deployed = max loss)
+    profit_target_pct: float = 0.50
+    stop_loss_pct: float = 0.30
 
     # Execution
     commission_per_contract: float = 0.85
@@ -59,10 +41,7 @@ class StrategyParams:
     max_capital_per_trade: float = 50000.0
 
 
-# Default sweep dimensions
+# Sweep grids (per the user's spec)
+PROFIT_TARGETS: tuple[float, ...] = (0.05, 0.10, 0.15, 0.20, 0.30, 0.40, 0.50)
+STOP_LOSSES: tuple[float, ...] = (0.10, 0.20, 0.30)
 TIME_STOPS: tuple[int, ...] = (30, 60, 120)
-ENTRY_CUTOFFS: tuple[time, ...] = (
-    time(11, 30),
-    time(13, 0),
-    time(15, 0),
-)

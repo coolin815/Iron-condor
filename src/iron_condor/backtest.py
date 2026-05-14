@@ -1,4 +1,9 @@
-"""Per-day backtest + sweep for the candle-pattern strategy."""
+"""Per-day backtest engine for the SPY 0DTE credit-spread strategy.
+
+For each trading day, find an ORB-direction signal, build the 2-leg credit
+spread, simulate entry at the credit (bid on short, ask on long), then walk
+minute-by-minute checking exits on (entry_credit - current_value) / capital.
+"""
 from __future__ import annotations
 
 import logging
@@ -11,12 +16,19 @@ import pandas as pd
 from tqdm import tqdm
 
 from .config import (
-    ENTRY_CUTOFFS,
+    PROFIT_TARGETS,
+    STOP_LOSSES,
     TIME_STOPS,
     StrategyParams,
     UNDERLYING,
 )
-from .orb import Signal, find_signal, pick_atm_contract
+from .orb import (
+    Signal,
+    SpreadLegs,
+    find_signal,
+    pick_spread_legs,
+    spread_width_dollars,
+)
 from .polygon_client import PolygonClient
 
 log = logging.getLogger(__name__)
@@ -34,22 +46,24 @@ class TradeResult:
     pnl_mode: str
     time_stop_min: int
     entry_cutoff: str
+    profit_target: float
+    stop_loss: float
     skip_fridays: bool
-    # signal details
+    # signal
     signal_time: datetime | None
-    pattern: str | None
     signal_direction: str | None
     signal_spot: float | None
-    vwap_at_signal: float | None
-    ema9_at_signal: float | None
-    ema21_at_signal: float | None
-    rsi_at_signal: float | None
+    orh: float | None
+    orl: float | None
     # position
-    contract: str | None
-    strike: float | None
+    short_strike: float | None
+    long_strike: float | None
+    right: str | None
+    spread_width: float | None
     qty: int
-    entry_price: float | None
-    exit_price: float | None
+    entry_credit: float | None      # per share, what you received
+    exit_value: float | None        # per share, what you paid to close
+    capital_deployed: float | None  # max loss in $
     exit_time: datetime | None
     minutes_held: float | None
     exit_reason: str
@@ -94,7 +108,6 @@ def _reindex_option_bars(bars: pd.DataFrame, day: date) -> pd.DataFrame:
 
 
 def _leg_price(bars: pd.DataFrame, ts: pd.Timestamp, column: str = "close") -> float | None:
-    """Return the option's `column` (open/high/low/close) at minute `ts`."""
     try:
         v = bars.loc[ts, column]
     except KeyError:
@@ -104,9 +117,12 @@ def _leg_price(bars: pd.DataFrame, ts: pd.Timestamp, column: str = "close") -> f
     return float(v)
 
 
-def _leg_mid(bars: pd.DataFrame, ts: pd.Timestamp) -> float | None:
-    """Backwards-compatible alias for close-price lookup."""
-    return _leg_price(bars, ts, "close")
+def _spread_mid(short_bars, long_bars, ts) -> float | None:
+    s = _leg_price(short_bars, ts, "close")
+    l = _leg_price(long_bars, ts, "close")
+    if s is None or l is None:
+        return None
+    return s - l
 
 
 # ---------------------------------------------------------------------------
@@ -125,20 +141,21 @@ def simulate_day(
         pnl_mode=params.pnl_mode,
         time_stop_min=params.time_stop_min,
         entry_cutoff=params.latest_entry.strftime("%H:%M"),
+        profit_target=params.profit_target_pct,
+        stop_loss=params.stop_loss_pct,
         skip_fridays=params.skip_fridays,
         signal_time=None,
-        pattern=None,
         signal_direction=None,
         signal_spot=None,
-        vwap_at_signal=None,
-        ema9_at_signal=None,
-        ema21_at_signal=None,
-        rsi_at_signal=None,
-        contract=None,
-        strike=None,
+        orh=None, orl=None,
+        short_strike=None,
+        long_strike=None,
+        right=None,
+        spread_width=None,
         qty=0,
-        entry_price=None,
-        exit_price=None,
+        entry_credit=None,
+        exit_value=None,
+        capital_deployed=None,
         exit_time=None,
         minutes_held=None,
         exit_reason="no_signal",
@@ -154,110 +171,133 @@ def simulate_day(
     if today_bars.empty:
         base.exit_reason = "no_data"
         return base
-    _, yesterday_bars = _previous_trading_day_with_data(day, client)
 
-    signal = find_signal(today_bars, yesterday_bars, params)
+    signal = find_signal(today_bars, params)
     if signal is None:
         return base
 
-    base.signal_time = signal.timestamp.to_pydatetime() if hasattr(
-        signal.timestamp, "to_pydatetime"
-    ) else signal.timestamp
-    base.pattern = signal.pattern
+    base.signal_time = (
+        signal.timestamp.to_pydatetime()
+        if hasattr(signal.timestamp, "to_pydatetime") else signal.timestamp
+    )
     base.signal_direction = signal.direction
     base.signal_spot = signal.spot
-    base.vwap_at_signal = signal.vwap
-    base.ema9_at_signal = signal.ema9
-    base.ema21_at_signal = signal.ema21
-    base.rsi_at_signal = signal.rsi
+    base.orh = signal.orh
+    base.orl = signal.orl
 
     contracts = client.get_option_contracts(UNDERLYING, day)
     if not contracts:
         base.exit_reason = "no_data"
         return base
-    pick = pick_atm_contract(signal, day, contracts, UNDERLYING)
-    if pick is None:
+    legs = pick_spread_legs(signal, day, contracts, params)
+    if legs is None:
         base.exit_reason = "no_data"
         return base
-    ticker, strike = pick
-    base.contract = ticker
-    base.strike = strike
+    base.short_strike = legs.short_strike
+    base.long_strike = legs.long_strike
+    base.right = legs.right
+    base.spread_width = spread_width_dollars(legs)
 
-    opt_bars = client.get_option_minute_bars(ticker, day)
-    opt_bars = _reindex_option_bars(opt_bars, day)
-    if opt_bars.empty:
+    tickers = legs.tickers(UNDERLYING)
+    short_bars = _reindex_option_bars(
+        client.get_option_minute_bars(tickers["short"], day), day
+    )
+    long_bars = _reindex_option_bars(
+        client.get_option_minute_bars(tickers["long"], day), day
+    )
+    if short_bars.empty or long_bars.empty:
         base.exit_reason = "no_data"
         return base
 
     h = params.leg_half_spread
-    entry_ts = pd.Timestamp(signal.timestamp).tz_convert(
-        "America/New_York"
-    ).floor("min")
-    # "Read candle close, buy candle open" — entry at the OPEN of the
-    # 1-min option bar at signal time (the price at signal_ts:00).
-    entry_mid = _leg_price(opt_bars, entry_ts, "open")
-    if entry_mid is None or entry_mid <= 0.05:
+    entry_ts = pd.Timestamp(signal.timestamp).tz_convert("America/New_York").floor("min")
+    short_open = _leg_price(short_bars, entry_ts, "open")
+    long_open = _leg_price(long_bars, entry_ts, "open")
+    if short_open is None or long_open is None:
         base.exit_reason = "no_data"
         return base
-    entry_ask = entry_mid + h
 
+    # Realistic entry: SELL short at its BID, BUY long at its ASK.
+    # Mid is the 1-min open; bid = mid - h, ask = mid + h.
+    short_fill = short_open - h          # we sell, so we get the bid
+    long_fill = long_open + h            # we buy, so we pay the ask
+    entry_credit = short_fill - long_fill
+    if entry_credit <= 0.0:
+        base.exit_reason = "no_data"
+        return base
+
+    width = spread_width_dollars(legs)
+    capital_per_spread = (width - entry_credit) * 100  # max loss in $
+    if capital_per_spread <= 0:
+        base.exit_reason = "no_data"
+        return base
+
+    # Sizing: full balance / capital_per_spread
     capital = min(balance, params.max_capital_per_trade)
-    per_contract_open = entry_ask * 100 + params.commission_per_contract
-    qty = int(floor(capital / per_contract_open))
+    qty = int(floor(capital / capital_per_spread))
     if qty < 1:
         base.exit_reason = "no_data"
         return base
-    base.qty = qty
-    base.entry_price = entry_ask
-    capital_deployed = entry_ask * 100 * qty + params.commission_per_contract * qty
 
+    base.qty = qty
+    base.entry_credit = entry_credit
+    base.capital_deployed = capital_per_spread * qty
+
+    # Walk forward
     time_stop_ts = entry_ts + pd.Timedelta(minutes=params.time_stop_min)
     hard_close_ts = pd.Timestamp(
         datetime.combine(day, params.hard_close)
     ).tz_localize("America/New_York")
     walk_end_ts = min(time_stop_ts, hard_close_ts)
-    after = opt_bars.index[opt_bars.index > entry_ts]
+    after = short_bars.index[short_bars.index > entry_ts]
     forward = [ts for ts in after if ts <= walk_end_ts]
 
     exit_ts: pd.Timestamp | None = None
-    exit_bid: float | None = None
+    exit_value: float | None = None
     exit_reason = "time_stop"
     use_gross = params.pnl_mode == "gross"
+
     for ts in forward:
-        mid = _leg_mid(opt_bars, ts)
-        if mid is None:
+        cur_mid = _spread_mid(short_bars, long_bars, ts)
+        if cur_mid is None:
             continue
-        bid = mid - h
+        # gross trigger uses mid-to-mid value; realized fill is at the
+        # adverse side (close cost = pay short's ask, receive long's bid).
         if use_gross:
-            exit_pct = (mid - entry_mid) / entry_mid
+            # Net P&L per share = entry_credit - current_mid; capital uses entry credit
+            pnl_per_share = entry_credit - cur_mid
+            pnl_pct = pnl_per_share / (width - entry_credit)
         else:
-            gross = (bid - entry_ask) * 100 * qty
-            fees = 2 * params.commission_per_contract * qty
-            net = gross - fees
-            exit_pct = net / capital_deployed
-        if exit_pct >= params.profit_target_pct:
-            exit_ts, exit_bid, exit_reason = ts, bid, "profit"
+            close_cost = cur_mid + 2 * h     # full spread to close
+            pnl_per_share = entry_credit - close_cost
+            pnl_pct = pnl_per_share / (width - entry_credit)
+        if pnl_pct >= params.profit_target_pct:
+            exit_ts, exit_value, exit_reason = ts, cur_mid, "profit"
             break
-        if exit_pct <= -params.stop_loss_pct:
-            exit_ts, exit_bid, exit_reason = ts, bid, "stop"
+        if pnl_pct <= -params.stop_loss_pct:
+            exit_ts, exit_value, exit_reason = ts, cur_mid, "stop"
             break
 
     if exit_ts is None:
-        cand = opt_bars.index[opt_bars.index <= walk_end_ts]
+        cand = short_bars.index[short_bars.index <= walk_end_ts]
         if len(cand) == 0:
             base.exit_reason = "no_data"
             return base
         exit_ts = cand[-1]
-        exit_mid = _leg_mid(opt_bars, exit_ts)
-        if exit_mid is None:
+        exit_value = _spread_mid(short_bars, long_bars, exit_ts)
+        if exit_value is None:
             base.exit_reason = "no_data"
             return base
-        exit_bid = exit_mid - h
 
-    gross = (exit_bid - entry_ask) * 100 * qty
-    fees = 2 * params.commission_per_contract * qty
+    # Realized P&L at close: pay short's ask, receive long's bid
+    close_cost_realized = exit_value + 2 * h
+    # gross = (entry_credit - close_cost_realized) * 100 * qty
+    gross = (entry_credit - close_cost_realized) * 100 * qty
+    # Commissions: 2 legs × 2 sides × qty
+    fees = 4 * params.commission_per_contract * qty
     net = gross - fees
-    base.exit_price = exit_bid
+
+    base.exit_value = exit_value
     base.exit_time = exit_ts.to_pydatetime()
     base.minutes_held = (exit_ts - entry_ts).total_seconds() / 60.0
     base.exit_reason = exit_reason
@@ -284,11 +324,10 @@ def run_backtest(
     balance = params.starting_balance
     results: list[TradeResult] = []
     desc = (
-        f"ts{params.time_stop_min}"
-        f"|co{params.latest_entry.strftime('%H%M')}"
-        f"|pnl={params.pnl_mode}"
-        f"|pt{int(params.profit_target_pct*100)}"
+        f"pt{int(params.profit_target_pct*100)}"
         f"|sl{int(params.stop_loss_pct*100)}"
+        f"|ts{params.time_stop_min}"
+        f"|co{params.latest_entry.strftime('%H%M')}"
     )
     for day in tqdm(days, desc=desc):
         result = simulate_day(day, params, balance, client)
@@ -300,40 +339,35 @@ def run_backtest(
 def run_sweep(
     start: date,
     end: date,
+    profit_targets: Iterable[float] = PROFIT_TARGETS,
+    stop_losses: Iterable[float] = STOP_LOSSES,
     time_stops: Iterable[int] = TIME_STOPS,
-    entry_cutoffs: Iterable[time] = ENTRY_CUTOFFS,
     pnl_modes: Iterable[str] = ("gross",),
-    profit_targets: Iterable[float] | None = None,
-    stop_losses: Iterable[float] | None = None,
     base_params: StrategyParams | None = None,
     client: PolygonClient | None = None,
 ) -> pd.DataFrame:
-    """Sweep (time_stop × entry_cutoff × pnl_mode × pt × sl)."""
+    """Sweep (pt × sl × time_stop × pnl_mode)."""
     client = client or PolygonClient()
     base = base_params or StrategyParams()
-    pts = list(profit_targets) if profit_targets is not None else [base.profit_target_pct]
-    sls = list(stop_losses) if stop_losses is not None else [base.stop_loss_pct]
     all_rows: list[pd.DataFrame] = []
 
     combos = [
-        (ts, co, pm, pt, sl)
+        (pt, sl, ts, pm)
+        for pt in profit_targets
+        for sl in stop_losses
         for ts in time_stops
-        for co in entry_cutoffs
         for pm in pnl_modes
-        for pt in pts
-        for sl in sls
     ]
-    for ts_min, co, pm, pt, sl in combos:
+    for pt, sl, ts_min, pm in combos:
         params = StrategyParams(
-            bar_timeframe_min=base.bar_timeframe_min,
+            or_window_min=base.or_window_min,
             earliest_entry=base.earliest_entry,
-            latest_entry=co,
+            latest_entry=base.latest_entry,
             time_stop_min=ts_min,
             hard_close=base.hard_close,
-            rsi_long_thresh=base.rsi_long_thresh,
-            rsi_short_thresh=base.rsi_short_thresh,
             skip_fridays=base.skip_fridays,
-            enabled_patterns=base.enabled_patterns,
+            short_strike_offset=base.short_strike_offset,
+            spread_width=base.spread_width,
             pnl_mode=pm,
             profit_target_pct=pt,
             stop_loss_pct=sl,
@@ -344,8 +378,7 @@ def run_sweep(
         )
         df = run_backtest(params, start, end, client=client)
         df["config"] = (
-            f"ts{ts_min}|co{co.strftime('%H%M')}|pnl={pm}"
-            f"|pt{int(pt*100)}|sl{int(sl*100)}"
+            f"pt{int(pt*100)}|sl{int(sl*100)}|ts{ts_min}|pnl={pm}"
         )
         all_rows.append(df)
     return pd.concat(all_rows, ignore_index=True)
