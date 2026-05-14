@@ -61,8 +61,8 @@ def main(argv: list[str] | None = None) -> int:
                    help=f"Time stops in minutes. Default: {list(TIME_STOPS)}. Repeatable.")
     p.add_argument("--pnl-mode", type=_parse_pnl_mode, action="append",
                    help="P&L mode: gross (mid-to-mid) or net (after fills). Default: gross. Repeatable.")
-    p.add_argument("--short-offset", type=float, default=None,
-                   help="Distance in $ from spot to short strike. Default: 1.0.")
+    p.add_argument("--short-offset", type=float, action="append",
+                   help="Distance in $ from spot to short strike. Default: 1.0. Repeatable to sweep.")
     p.add_argument("--spread-width", type=float, default=None,
                    help="Distance between short and long strike in $. Default: 1.0.")
     p.add_argument("--include-fridays", action="store_true",
@@ -75,10 +75,11 @@ def main(argv: list[str] | None = None) -> int:
     client = PolygonClient()
 
     overrides = {"skip_fridays": not args.include_fridays}
-    if args.short_offset is not None:
-        overrides["short_strike_offset"] = args.short_offset
     if args.spread_width is not None:
         overrides["spread_width"] = args.spread_width
+    # If short-offset is given for the smoke / single-config path, take the first
+    if args.short_offset:
+        overrides["short_strike_offset"] = args.short_offset[0]
     base_params = StrategyParams(**overrides)
 
     if args.smoke:
@@ -117,10 +118,12 @@ def main(argv: list[str] | None = None) -> int:
         sls = args.sl or list(STOP_LOSSES)
         time_stops = args.time_stop or list(TIME_STOPS)
         pnl_modes = args.pnl_mode or [base_params.pnl_mode]
-        n = len(pts) * len(sls) * len(time_stops) * len(pnl_modes)
+        short_offsets = args.short_offset or [base_params.short_strike_offset]
+        n = (len(pts) * len(sls) * len(time_stops) * len(pnl_modes)
+             * len(short_offsets))
         print(
             f"Sweep: {n} configs (pt={pts}, sl={sls}, ts={time_stops}, "
-            f"pnl={pnl_modes}, short_offset={base_params.short_strike_offset}, "
+            f"pnl={pnl_modes}, short_offset={short_offsets}, "
             f"width={base_params.spread_width}, "
             f"skip_fridays={base_params.skip_fridays})"
         )
@@ -131,6 +134,7 @@ def main(argv: list[str] | None = None) -> int:
             stop_losses=sls,
             time_stops=time_stops,
             pnl_modes=pnl_modes,
+            short_offsets=short_offsets,
             base_params=base_params,
             client=client,
         )
