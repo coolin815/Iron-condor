@@ -10,6 +10,8 @@ from typing import Literal
 
 UNDERLYING: str = "SPY"
 
+DirectionMode = Literal["continuation", "reversion"]
+
 
 @dataclass(frozen=True)
 class StrategyParams:
@@ -20,6 +22,11 @@ class StrategyParams:
     time_stop_min: int = 60                # cap holding period
     hard_close: time = time(15, 55)
     skip_fridays: bool = True
+
+    # ORB direction interpretation:
+    #   "continuation" — break above ORH -> bull put; below ORL -> bear call
+    #   "reversion"   — break above ORH -> bear call; below ORL -> bull put
+    direction_mode: DirectionMode = "reversion"
 
     # Strike selection (per spread)
     short_strike_offset: float = 1.0       # short strike $X OTM from spot

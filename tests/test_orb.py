@@ -39,22 +39,44 @@ def test_opening_range_high_low() -> None:
     assert levels.orl == 495
 
 
-def test_signal_above_orh_is_bull_put() -> None:
+def test_signal_above_orh_reversion_is_bear_call() -> None:
+    """Default direction_mode = 'reversion'. Break above ORH expects the
+    move to fade, so we sell a BEAR CALL (bet price stays below ORH)."""
     rows = [(500, 501, 499, 500) for _ in range(30)]   # OR: 9:30-9:59
     rows.append((500, 503, 500, 502.5))                # 10:00: first break above ORH=501
+    df = _bars("2026-05-12 09:30", rows)
+    params = StrategyParams(skip_fridays=False)  # default direction_mode='reversion'
+    sig = find_signal(df, params)
+    assert sig is not None
+    assert sig.direction == "bear_call"
+    assert sig.spot == 502.5
+
+
+def test_signal_below_orl_reversion_is_bull_put() -> None:
+    rows = [(500, 501, 499, 500) for _ in range(30)]
+    rows.append((500, 500, 497, 498))    # 10:00: first break below ORL=499
     df = _bars("2026-05-12 09:30", rows)
     params = StrategyParams(skip_fridays=False)
     sig = find_signal(df, params)
     assert sig is not None
     assert sig.direction == "bull_put"
-    assert sig.spot == 502.5
 
 
-def test_signal_below_orl_is_bear_call() -> None:
+def test_signal_continuation_above_orh_is_bull_put() -> None:
     rows = [(500, 501, 499, 500) for _ in range(30)]
-    rows.append((500, 500, 497, 498))    # 10:00: first break below ORL=499
+    rows.append((500, 503, 500, 502.5))
     df = _bars("2026-05-12 09:30", rows)
-    params = StrategyParams(skip_fridays=False)
+    params = StrategyParams(skip_fridays=False, direction_mode="continuation")
+    sig = find_signal(df, params)
+    assert sig is not None
+    assert sig.direction == "bull_put"
+
+
+def test_signal_continuation_below_orl_is_bear_call() -> None:
+    rows = [(500, 501, 499, 500) for _ in range(30)]
+    rows.append((500, 500, 497, 498))
+    df = _bars("2026-05-12 09:30", rows)
+    params = StrategyParams(skip_fridays=False, direction_mode="continuation")
     sig = find_signal(df, params)
     assert sig is not None
     assert sig.direction == "bear_call"

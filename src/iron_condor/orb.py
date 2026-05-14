@@ -115,8 +115,9 @@ def find_signal(
     today_1min: pd.DataFrame,
     params: StrategyParams,
 ) -> Signal | None:
-    """First 1-min close outside the OR inside the entry window. None on no
-    signal, no data, or Friday-skip."""
+    """First 1-min close outside the OR inside the entry window. Direction
+    interpretation depends on params.direction_mode (continuation vs reversion).
+    None on no signal, no data, or Friday-skip."""
     if today_1min.empty:
         return None
     if params.skip_fridays:
@@ -132,18 +133,28 @@ def find_signal(
     if et.empty:
         return None
 
+    revert = params.direction_mode == "reversion"
+
     mask = (et.index.time >= params.earliest_entry) & (et.index.time <= params.latest_entry)
     window = et[mask]
     for ts, row in window.iterrows():
         close = float(row["close"])
         if close > levels.orh:
+            # Break above ORH:
+            #   continuation: bull put (bet stays high)
+            #   reversion: bear call (bet fades back down)
+            direction = "bear_call" if revert else "bull_put"
             return Signal(
-                timestamp=ts, direction="bull_put",
+                timestamp=ts, direction=direction,
                 spot=close, orh=levels.orh, orl=levels.orl,
             )
         if close < levels.orl:
+            # Break below ORL:
+            #   continuation: bear call (bet stays low)
+            #   reversion: bull put (bet bounces back up)
+            direction = "bull_put" if revert else "bear_call"
             return Signal(
-                timestamp=ts, direction="bear_call",
+                timestamp=ts, direction=direction,
                 spot=close, orh=levels.orh, orl=levels.orl,
             )
     return None

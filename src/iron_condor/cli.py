@@ -68,6 +68,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="Distance in $ from spot to short strike. Default: 1.0. Repeatable to sweep.")
     p.add_argument("--spread-width", type=float, default=None,
                    help="Distance between short and long strike in $. Default: 1.0.")
+    p.add_argument("--direction", choices=["continuation", "reversion"], action="append",
+                   help="ORB direction interpretation. Default: reversion. Repeatable to sweep both.")
     p.add_argument("--include-fridays", action="store_true",
                    help="Override the default Friday-skip rule.")
 
@@ -122,11 +124,13 @@ def main(argv: list[str] | None = None) -> int:
         time_stops = args.time_stop or list(TIME_STOPS)
         pnl_modes = args.pnl_mode or [base_params.pnl_mode]
         short_offsets = args.short_offset or [base_params.short_strike_offset]
+        directions = args.direction or [base_params.direction_mode]
         n = (len(pts) * len(sls) * len(time_stops) * len(pnl_modes)
-             * len(short_offsets))
+             * len(short_offsets) * len(directions))
         print(
             f"Sweep: {n} configs (pt={pts}, sl={sls}, ts={time_stops}, "
             f"pnl={pnl_modes}, short_offset={short_offsets}, "
+            f"direction={directions}, "
             f"width={base_params.spread_width}, "
             f"skip_fridays={base_params.skip_fridays})"
         )
@@ -138,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
             time_stops=time_stops,
             pnl_modes=pnl_modes,
             short_offsets=short_offsets,
+            direction_modes=directions,
             base_params=base_params,
             client=client,
         )

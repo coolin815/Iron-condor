@@ -347,24 +347,27 @@ def run_sweep(
     time_stops: Iterable[int] = TIME_STOPS,
     pnl_modes: Iterable[str] = ("gross",),
     short_offsets: Iterable[float] | None = None,
+    direction_modes: Iterable[str] | None = None,
     base_params: StrategyParams | None = None,
     client: PolygonClient | None = None,
 ) -> pd.DataFrame:
-    """Sweep (pt × sl × time_stop × pnl_mode × short_offset)."""
+    """Sweep (pt × sl × time_stop × pnl_mode × short_offset × direction_mode)."""
     client = client or PolygonClient()
     base = base_params or StrategyParams()
     offsets = list(short_offsets) if short_offsets is not None else [base.short_strike_offset]
+    dirs = list(direction_modes) if direction_modes is not None else [base.direction_mode]
     all_rows: list[pd.DataFrame] = []
 
     combos = [
-        (pt, sl, ts, pm, off)
+        (pt, sl, ts, pm, off, dm)
         for pt in profit_targets
         for sl in stop_losses
         for ts in time_stops
         for pm in pnl_modes
         for off in offsets
+        for dm in dirs
     ]
-    for pt, sl, ts_min, pm, off in combos:
+    for pt, sl, ts_min, pm, off, dm in combos:
         params = StrategyParams(
             or_window_min=base.or_window_min,
             earliest_entry=base.earliest_entry,
@@ -372,6 +375,7 @@ def run_sweep(
             time_stop_min=ts_min,
             hard_close=base.hard_close,
             skip_fridays=base.skip_fridays,
+            direction_mode=dm,
             short_strike_offset=off,
             spread_width=base.spread_width,
             pnl_mode=pm,
@@ -384,7 +388,7 @@ def run_sweep(
         )
         df = run_backtest(params, start, end, client=client)
         df["config"] = (
-            f"pt{int(pt*100)}|sl{int(sl*100)}|ts{ts_min}|so{off:g}|pnl={pm}"
+            f"pt{int(pt*100)}|sl{int(sl*100)}|ts{ts_min}|so{off:g}|dir={dm[:4]}|pnl={pm}"
         )
         all_rows.append(df)
     return pd.concat(all_rows, ignore_index=True)
