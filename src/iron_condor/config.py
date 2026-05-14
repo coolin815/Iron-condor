@@ -29,7 +29,15 @@ class StrategyParams:
     # P&L measurement: "gross" (option mid-to-mid) or "net" (after fills)
     pnl_mode: Literal["gross", "net"] = "gross"
 
-    # Exits on the option price (since we're long a single leg again):
+    # Entry timing:
+    #   "instant"        — fill at print_price + full bid-ask spread (models a
+    #                      WebSocket-driven bot reacting in ~1 sec, paying the
+    #                      ask just above the print)
+    #   "next_bar_open"  — fill at the OPEN of the bar AFTER the print, +
+    #                      half-spread. More conservative (~60s reaction delay).
+    entry_mode: Literal["instant", "next_bar_open"] = "instant"
+
+    # Exits on the option price (single-leg long):
     profit_target_pct: float = 0.30    # +30% on option mid
     stop_loss_pct: float = 0.30        # -30% on option mid
 
@@ -44,6 +52,7 @@ class StrategyParams:
 
 # Sweep grids
 SIZE_THRESHOLDS: tuple[int, ...] = (1000, 1500, 2000, 2500)
-PROFIT_TARGETS: tuple[float, ...] = (0.20, 0.30, 0.50, 1.00)
+PROFIT_TARGETS: tuple[float, ...] = (0.10, 0.20, 0.30, 0.50, 1.00)
 STOP_LOSSES: tuple[float, ...] = (0.20, 0.30, 0.50)
 TIME_STOPS: tuple[int, ...] = (15, 30, 60)
+ENTRY_MODES: tuple[str, ...] = ("instant", "next_bar_open")

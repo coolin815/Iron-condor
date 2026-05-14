@@ -16,6 +16,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from .config import (
+    ENTRY_MODES,
     PROFIT_TARGETS,
     SIZE_THRESHOLDS,
     STOP_LOSSES,
@@ -166,12 +167,24 @@ def simulate_day(
         return base
 
     h = params.leg_half_spread
-    entry_ts = pd.Timestamp(signal.timestamp).tz_convert("America/New_York").floor("min")
-    entry_open = _leg_price(opt_bars, entry_ts, "open")
-    if entry_open is None or entry_open <= 0.05:
+    if params.entry_mode == "instant":
+        # Fill just after the print at the post-print ask. Model = print_price
+        # + one full spread (we cross h to take liquidity, and the buyer just
+        # lifted the offer so the new ask is approximately h higher again).
+        entry_ts = pd.Timestamp(signal.print_timestamp).tz_convert("America/New_York").floor("min")
+        entry_mid = float(signal.trade_price)
+        entry_ask = entry_mid + 2 * h
+    else:  # next_bar_open
+        entry_ts = pd.Timestamp(signal.timestamp).tz_convert("America/New_York").floor("min")
+        entry_open = _leg_price(opt_bars, entry_ts, "open")
+        if entry_open is None or entry_open <= 0.05:
+            base.exit_reason = "no_data"
+            return base
+        entry_mid = entry_open
+        entry_ask = entry_open + h
+    if entry_mid <= 0.05:
         base.exit_reason = "no_data"
         return base
-    entry_ask = entry_open + h
 
     capital = min(balance, params.max_capital_per_trade)
     per_contract_open = entry_ask * 100 + params.commission_per_contract
@@ -277,6 +290,7 @@ def run_sweep(
     stop_losses: Iterable[float] = STOP_LOSSES,
     time_stops: Iterable[int] = TIME_STOPS,
     pnl_modes: Iterable[str] = ("gross",),
+    entry_modes: Iterable[str] = ENTRY_MODES,
     base_params: StrategyParams | None = None,
     client: PolygonClient | None = None,
 ) -> pd.DataFrame:
@@ -285,14 +299,15 @@ def run_sweep(
     all_rows: list[pd.DataFrame] = []
 
     combos = [
-        (sz, pt, sl, ts, pm)
+        (sz, pt, sl, ts, pm, em)
         for sz in size_thresholds
         for pt in profit_targets
         for sl in stop_losses
         for ts in time_stops
         for pm in pnl_modes
+        for em in entry_modes
     ]
-    for sz, pt, sl, ts_min, pm in combos:
+    for sz, pt, sl, ts_min, pm, em in combos:
         params = StrategyParams(
             earliest_entry=base.earliest_entry,
             latest_entry=base.latest_entry,
@@ -302,6 +317,7 @@ def run_sweep(
             size_threshold=sz,
             strike_window=base.strike_window,
             pnl_mode=pm,
+            entry_mode=em,
             profit_target_pct=pt,
             stop_loss_pct=sl,
             commission_per_contract=base.commission_per_contract,
@@ -311,7 +327,8 @@ def run_sweep(
         )
         df = run_backtest(params, start, end, client=client)
         df["config"] = (
-            f"sz{sz}|pt{int(pt*100)}|sl{int(sl*100)}|ts{ts_min}|pnl={pm}"
+            f"sz{sz}|pt{int(pt*100)}|sl{int(sl*100)}|ts{ts_min}"
+            f"|em={em[:4]}|pnl={pm}"
         )
         all_rows.append(df)
     return pd.concat(all_rows, ignore_index=True)

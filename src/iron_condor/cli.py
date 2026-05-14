@@ -79,6 +79,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="P&L mode: gross (mid-to-mid) or net (after fills). Default: gross.")
     p.add_argument("--strike-window", type=float, default=None,
                    help="Half-width $ around opening spot for scanned strikes. Default: 5.0.")
+    p.add_argument("--entry-mode", choices=["instant", "next_bar_open"], action="append",
+                   help="Entry timing: instant (fill at print + spread) or next_bar_open "
+                        "(fill at next minute's open). Default: sweep both.")
     p.add_argument("--include-fridays", action="store_true",
                    help="Override the default Friday-skip rule.")
 
@@ -127,16 +130,19 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Backtest window: {start} -> {end}")
 
     if args.sweep:
+        from .config import ENTRY_MODES
         size_thresholds = args.size_threshold or list(SIZE_THRESHOLDS)
         pts = args.pt or list(PROFIT_TARGETS)
         sls = args.sl or list(STOP_LOSSES)
         time_stops = args.time_stop or list(TIME_STOPS)
         pnl_modes = args.pnl_mode or [base_params.pnl_mode]
+        entry_modes = args.entry_mode or list(ENTRY_MODES)
         n = (len(size_thresholds) * len(pts) * len(sls)
-             * len(time_stops) * len(pnl_modes))
+             * len(time_stops) * len(pnl_modes) * len(entry_modes))
         print(
             f"Sweep: {n} configs (size_threshold={size_thresholds}, "
             f"pt={pts}, sl={sls}, ts={time_stops}, pnl={pnl_modes}, "
+            f"entry_mode={entry_modes}, "
             f"strike_window=±${base_params.strike_window})"
         )
 
@@ -147,6 +153,7 @@ def main(argv: list[str] | None = None) -> int:
             stop_losses=sls,
             time_stops=time_stops,
             pnl_modes=pnl_modes,
+            entry_modes=entry_modes,
             base_params=base_params,
             client=client,
         )
