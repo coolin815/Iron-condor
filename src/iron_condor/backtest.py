@@ -261,20 +261,23 @@ def simulate_day(
         cur_mid = _spread_mid(short_bars, long_bars, ts)
         if cur_mid is None:
             continue
-        # gross trigger uses mid-to-mid value; realized fill is at the
-        # adverse side (close cost = pay short's ask, receive long's bid).
+        # PT/SL measured as % of CREDIT COLLECTED:
+        #   PT X% fires when current spread value <= (1 - X) * entry_credit
+        #     i.e. we've captured X% of the credit
+        #   SL X% fires when current spread value >= (1 + X) * entry_credit
+        #     i.e. we've given back X% of the credit
+        # In "gross" mode the trigger uses mid-to-mid value; in "net" mode the
+        # full bid/ask close cost is added. Realized P&L always uses real fills.
         if use_gross:
-            # Net P&L per share = entry_credit - current_mid; capital uses entry credit
             pnl_per_share = entry_credit - cur_mid
-            pnl_pct = pnl_per_share / (width - entry_credit)
         else:
-            close_cost = cur_mid + 2 * h     # full spread to close
+            close_cost = cur_mid + 2 * h
             pnl_per_share = entry_credit - close_cost
-            pnl_pct = pnl_per_share / (width - entry_credit)
-        if pnl_pct >= params.profit_target_pct:
+        pnl_pct_of_credit = pnl_per_share / entry_credit
+        if pnl_pct_of_credit >= params.profit_target_pct:
             exit_ts, exit_value, exit_reason = ts, cur_mid, "profit"
             break
-        if pnl_pct <= -params.stop_loss_pct:
+        if pnl_pct_of_credit <= -params.stop_loss_pct:
             exit_ts, exit_value, exit_reason = ts, cur_mid, "stop"
             break
 

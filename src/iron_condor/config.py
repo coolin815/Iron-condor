@@ -28,7 +28,9 @@ class StrategyParams:
     # P&L measurement: "gross" (mid-to-mid spread value) or "net" (after fills)
     pnl_mode: Literal["gross", "net"] = "gross"
 
-    # Exits (as fraction of capital deployed = max loss)
+    # Exits (as fraction of CREDIT COLLECTED, TastyTrade-style):
+    #   PT X% -> exit when spread value <= (1 - X) * entry_credit
+    #   SL X% -> exit when spread value >= (1 + X) * entry_credit
     profit_target_pct: float = 0.50
     stop_loss_pct: float = 0.30
 

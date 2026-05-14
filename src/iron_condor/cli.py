@@ -54,9 +54,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--sweep", action="store_true")
     p.add_argument("--verbose", "-v", action="store_true")
     p.add_argument("--pt", type=float, action="append",
-                   help=f"Profit targets (e.g. 0.20). Default: {list(PROFIT_TARGETS)}. Repeatable.")
+                   help=f"Profit target as fraction of credit captured (e.g. 0.50 = take 50%% "
+                        f"of the credit). Default: {list(PROFIT_TARGETS)}. Repeatable.")
     p.add_argument("--sl", type=float, action="append",
-                   help=f"Stop losses. Default: {list(STOP_LOSSES)}. Repeatable.")
+                   help=f"Stop loss as fraction of credit given back (e.g. 0.30 = stop when "
+                        f"30%% of the credit has been lost). Default: {list(STOP_LOSSES)}. "
+                        "Repeatable.")
     p.add_argument("--time-stop", type=int, action="append",
                    help=f"Time stops in minutes. Default: {list(TIME_STOPS)}. Repeatable.")
     p.add_argument("--pnl-mode", type=_parse_pnl_mode, action="append",
