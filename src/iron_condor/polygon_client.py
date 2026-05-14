@@ -89,10 +89,9 @@ class PolygonClient:
     # Internal HTTP
     # ------------------------------------------------------------------
 
-    def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        params = dict(params or {})
-        params["apiKey"] = self.api_key
-        url = f"{BASE_URL}{path}"
+    def _request(
+        self, url: str, params: dict[str, Any], label: str
+    ) -> dict[str, Any]:
         for attempt in range(MAX_RETRIES):
             self.throttle.wait()
             try:
@@ -103,21 +102,18 @@ class PolygonClient:
                 wait = min(60.0, 2.0 ** attempt)
                 log.warning(
                     "Polygon %s -> network error (%s); sleeping %.0fs (attempt %d/%d)",
-                    path, type(e).__name__, wait, attempt + 1, MAX_RETRIES,
+                    label, type(e).__name__, wait, attempt + 1, MAX_RETRIES,
                 )
                 _time.sleep(wait)
                 continue
             if resp.status_code == 200:
                 return resp.json()
             if resp.status_code == 429:
-                # Polygon's rate-limit window is per minute. Honor Retry-After
-                # if provided, otherwise wait a full minute for the bucket to
-                # refill.
                 retry_after = resp.headers.get("Retry-After")
                 wait = float(retry_after) if retry_after else 60.0
                 log.warning(
                     "Polygon %s -> 429 rate-limited, sleeping %.0fs (attempt %d/%d)",
-                    path, wait, attempt + 1, MAX_RETRIES,
+                    label, wait, attempt + 1, MAX_RETRIES,
                 )
                 _time.sleep(wait)
                 continue
@@ -125,12 +121,17 @@ class PolygonClient:
                 wait = min(60.0, 2.0 ** attempt)
                 log.warning(
                     "Polygon %s -> %s, sleeping %.0fs (attempt %d/%d)",
-                    path, resp.status_code, wait, attempt + 1, MAX_RETRIES,
+                    label, resp.status_code, wait, attempt + 1, MAX_RETRIES,
                 )
                 _time.sleep(wait)
                 continue
             resp.raise_for_status()
-        raise RuntimeError(f"Polygon {path} failed after {MAX_RETRIES} retries")
+        raise RuntimeError(f"Polygon {label} failed after {MAX_RETRIES} retries")
+
+    def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        params = dict(params or {})
+        params["apiKey"] = self.api_key
+        return self._request(f"{BASE_URL}{path}", params, path)
 
     def _paginate(self, path: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -138,12 +139,9 @@ class PolygonClient:
         out.extend(data.get("results") or [])
         next_url = data.get("next_url")
         while next_url:
-            self.throttle.wait()
-            resp = self.session.get(
-                next_url, params={"apiKey": self.api_key}, timeout=30
+            data = self._request(
+                next_url, {"apiKey": self.api_key}, f"{path} (next_url)"
             )
-            resp.raise_for_status()
-            data = resp.json()
             out.extend(data.get("results") or [])
             next_url = data.get("next_url")
         return out
