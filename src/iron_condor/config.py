@@ -51,8 +51,8 @@ class StrategyParams:
 
 
 # Sweep grids
-SIZE_THRESHOLDS: tuple[int, ...] = (1000, 1500, 2000, 2500)
-PROFIT_TARGETS: tuple[float, ...] = (0.10, 0.20, 0.30, 0.50, 1.00)
-STOP_LOSSES: tuple[float, ...] = (0.20, 0.30, 0.50)
+SIZE_THRESHOLDS: tuple[int, ...] = (3000, 3500, 4000, 4500, 5000)
+PROFIT_TARGETS: tuple[float, ...] = (0.05, 0.10, 0.15)
+STOP_LOSSES: tuple[float, ...] = (0.10, 0.15, 0.20, 0.25, 0.30)
 TIME_STOPS: tuple[int, ...] = (15, 30, 60)
 ENTRY_MODES: tuple[str, ...] = ("instant", "next_bar_open")
