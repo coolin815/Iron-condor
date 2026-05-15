@@ -20,7 +20,6 @@ from .config import (
     PROFIT_TARGETS,
     SIZE_THRESHOLDS,
     STOP_LOSSES,
-    TIME_STOPS,
     StrategyParams,
     UNDERLYING,
 )
@@ -41,7 +40,6 @@ class TradeResult:
     # config
     pnl_mode: str
     size_threshold: int
-    time_stop_min: int
     profit_target: float
     stop_loss: float
     skip_fridays: bool
@@ -112,7 +110,6 @@ def simulate_day(
         day=day,
         pnl_mode=params.pnl_mode,
         size_threshold=params.size_threshold,
-        time_stop_min=params.time_stop_min,
         profit_target=params.profit_target_pct,
         stop_loss=params.stop_loss_pct,
         skip_fridays=params.skip_fridays,
@@ -195,12 +192,10 @@ def simulate_day(
     base.qty = qty
     base.entry_price = entry_ask
 
-    # Walk for exit
-    time_stop_ts = entry_ts + pd.Timedelta(minutes=params.time_stop_min)
-    hard_close_ts = pd.Timestamp(
+    # Walk for exit (until PT, SL, or hard close)
+    walk_end_ts = pd.Timestamp(
         datetime.combine(day, params.hard_close)
     ).tz_localize("America/New_York")
-    walk_end_ts = min(time_stop_ts, hard_close_ts)
     after = opt_bars.index[opt_bars.index > entry_ts]
     forward = [ts for ts in after if ts <= walk_end_ts]
 
@@ -273,7 +268,6 @@ def run_backtest(
         f"sz{params.size_threshold}"
         f"|pt{int(params.profit_target_pct*100)}"
         f"|sl{int(params.stop_loss_pct*100)}"
-        f"|ts{params.time_stop_min}"
     )
     for day in tqdm(days, desc=desc):
         result = simulate_day(day, params, balance, client)
@@ -288,7 +282,6 @@ def run_sweep(
     size_thresholds: Iterable[int] = SIZE_THRESHOLDS,
     profit_targets: Iterable[float] = PROFIT_TARGETS,
     stop_losses: Iterable[float] = STOP_LOSSES,
-    time_stops: Iterable[int] = TIME_STOPS,
     pnl_modes: Iterable[str] = ("gross",),
     entry_modes: Iterable[str] = ENTRY_MODES,
     base_params: StrategyParams | None = None,
@@ -299,19 +292,17 @@ def run_sweep(
     all_rows: list[pd.DataFrame] = []
 
     combos = [
-        (sz, pt, sl, ts, pm, em)
+        (sz, pt, sl, pm, em)
         for sz in size_thresholds
         for pt in profit_targets
         for sl in stop_losses
-        for ts in time_stops
         for pm in pnl_modes
         for em in entry_modes
     ]
-    for sz, pt, sl, ts_min, pm, em in combos:
+    for sz, pt, sl, pm, em in combos:
         params = StrategyParams(
             earliest_entry=base.earliest_entry,
             latest_entry=base.latest_entry,
-            time_stop_min=ts_min,
             hard_close=base.hard_close,
             skip_fridays=base.skip_fridays,
             size_threshold=sz,
@@ -327,7 +318,7 @@ def run_sweep(
         )
         df = run_backtest(params, start, end, client=client)
         df["config"] = (
-            f"sz{sz}|pt{int(pt*100)}|sl{int(sl*100)}|ts{ts_min}"
+            f"sz{sz}|pt{int(pt*100)}|sl{int(sl*100)}"
             f"|em={em[:4]}|pnl={pm}"
         )
         all_rows.append(df)

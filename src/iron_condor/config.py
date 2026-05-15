@@ -16,7 +16,6 @@ class StrategyParams:
     # Signal
     earliest_entry: time = time(9, 35)     # right after the open
     latest_entry: time = time(15, 0)       # 12:00 PT — no new entries this late
-    time_stop_min: int = 30
     hard_close: time = time(15, 55)
     skip_fridays: bool = True
 
@@ -54,5 +53,4 @@ class StrategyParams:
 SIZE_THRESHOLDS: tuple[int, ...] = (3000, 3500, 4000, 4500, 5000)
 PROFIT_TARGETS: tuple[float, ...] = (0.05, 0.10, 0.15)
 STOP_LOSSES: tuple[float, ...] = (0.10, 0.15, 0.20, 0.25, 0.30)
-TIME_STOPS: tuple[int, ...] = (30,)
 ENTRY_MODES: tuple[str, ...] = ("instant", "next_bar_open")

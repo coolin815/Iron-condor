@@ -21,7 +21,6 @@ from .config import (
     PROFIT_TARGETS,
     SIZE_THRESHOLDS,
     STOP_LOSSES,
-    TIME_STOPS,
     StrategyParams,
 )
 from .metrics import summarize_run, summarize_sweep
@@ -73,8 +72,6 @@ def main(argv: list[str] | None = None) -> int:
                         f"Default: {list(PROFIT_TARGETS)}. Repeatable.")
     p.add_argument("--sl", type=float, action="append",
                    help=f"Stop loss as fraction. Default: {list(STOP_LOSSES)}. Repeatable.")
-    p.add_argument("--time-stop", type=int, action="append",
-                   help=f"Time stops in minutes. Default: {list(TIME_STOPS)}. Repeatable.")
     p.add_argument("--pnl-mode", type=_parse_pnl_mode, action="append",
                    help="P&L mode: gross (mid-to-mid) or net (after fills). Default: gross.")
     p.add_argument("--strike-window", type=float, default=None,
@@ -134,14 +131,13 @@ def main(argv: list[str] | None = None) -> int:
         size_thresholds = args.size_threshold or list(SIZE_THRESHOLDS)
         pts = args.pt or list(PROFIT_TARGETS)
         sls = args.sl or list(STOP_LOSSES)
-        time_stops = args.time_stop or list(TIME_STOPS)
         pnl_modes = args.pnl_mode or [base_params.pnl_mode]
         entry_modes = args.entry_mode or list(ENTRY_MODES)
         n = (len(size_thresholds) * len(pts) * len(sls)
-             * len(time_stops) * len(pnl_modes) * len(entry_modes))
+             * len(pnl_modes) * len(entry_modes))
         print(
             f"Sweep: {n} configs (size_threshold={size_thresholds}, "
-            f"pt={pts}, sl={sls}, ts={time_stops}, pnl={pnl_modes}, "
+            f"pt={pts}, sl={sls}, pnl={pnl_modes}, "
             f"entry_mode={entry_modes}, "
             f"strike_window=±${base_params.strike_window})"
         )
@@ -151,7 +147,6 @@ def main(argv: list[str] | None = None) -> int:
             size_thresholds=size_thresholds,
             profit_targets=pts,
             stop_losses=sls,
-            time_stops=time_stops,
             pnl_modes=pnl_modes,
             entry_modes=entry_modes,
             base_params=base_params,
