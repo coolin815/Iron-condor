@@ -11,21 +11,26 @@ Notes / honest caveats:
     trade_price <  bar_open  -> classify as SELL aggressor (we skip those)
   A more accurate classification needs NBBO quote data, which is much
   heavier to fetch.
-- Multi-leg / hedge detection is NOT done. A 1000-contract call print
-  might be one leg of a calendar spread or a covered call; we'll trade
-  it as if it were a directional bet. Known noise source.
+- Multi-leg filtering uses Polygon's OPRA condition codes. Prints flagged
+  as part of a multi-leg / spread / stock-tied order are skipped when
+  params.exclude_multi_leg is True. The condition-code set lives in
+  config.MULTI_LEG_CONDITION_CODES.
 - No Fridays.
 """
 from __future__ import annotations
 
+import ast
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Literal
 
 import pandas as pd
 
-from .config import StrategyParams
+from .config import MULTI_LEG_CONDITION_CODES, StrategyParams
 from .polygon_client import PolygonClient, build_option_ticker
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +96,39 @@ def _classify_aggressor(
     return "sell"
 
 
+def _parse_conditions(raw: object) -> set[int]:
+    """Parse Polygon's trade-conditions field into a set of int codes.
+
+    Polygon returns conditions as a list[int]. After parquet caching we
+    stored it as a string repr like "[1, 152]" — handle both.
+    """
+    if raw is None:
+        return set()
+    if isinstance(raw, (list, tuple)):
+        try:
+            return {int(c) for c in raw}
+        except (TypeError, ValueError):
+            return set()
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s or s in ("nan", "[]", "None"):
+            return set()
+        try:
+            parsed = ast.literal_eval(s)
+        except (ValueError, SyntaxError):
+            return set()
+        if isinstance(parsed, (list, tuple)):
+            try:
+                return {int(c) for c in parsed}
+            except (TypeError, ValueError):
+                return set()
+    return set()
+
+
+def _is_multi_leg(conditions_raw: object) -> bool:
+    return bool(_parse_conditions(conditions_raw) & MULTI_LEG_CONDITION_CODES)
+
+
 # ---------------------------------------------------------------------------
 # Signal detection
 # ---------------------------------------------------------------------------
@@ -132,6 +170,8 @@ def find_signal(
     threshold = params.size_threshold
 
     best: tuple[pd.Timestamp, Signal] | None = None  # (timestamp, signal)
+    n_large = 0
+    n_multi_leg = 0
     for c in nearby:
         try:
             strike = float(c["strike_price"])
@@ -156,6 +196,10 @@ def find_signal(
         bars = _to_et(bars)
 
         for _, row in big.iterrows():
+            n_large += 1
+            if params.exclude_multi_leg and _is_multi_leg(row.get("conditions")):
+                n_multi_leg += 1
+                continue
             ts_ns = int(row["sip_timestamp_ns"])
             ts = pd.Timestamp(ts_ns, unit="ns", tz="UTC").tz_convert("America/New_York")
             tt = ts.time()
@@ -187,6 +231,11 @@ def find_signal(
                 best = (ts, sig)
             break  # first qualifying print per contract is enough
 
+    if n_large:
+        log.debug(
+            "%s: %d large prints, %d filtered as multi-leg",
+            day, n_large, n_multi_leg,
+        )
     if best is None:
         return None
     return best[1]

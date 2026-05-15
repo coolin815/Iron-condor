@@ -11,6 +11,26 @@ from typing import Literal
 UNDERLYING: str = "SPY"
 
 
+# Polygon/OPRA condition codes that indicate a print is part of a
+# multi-leg / complex / spread / stock-tied order. A "buy" print with any
+# of these codes is almost certainly one leg of a vertical, condor,
+# risk-reversal, or stock+option combo — not a directional bet — so we
+# skip it. This list is based on the commonly documented OPRA reference;
+# if the filter is over- or under-aggressive you can adjust the set.
+MULTI_LEG_CONDITION_CODES: frozenset[int] = frozenset({
+    14,  # Multi-Leg Auto-Electronic Trade Against Single-Leg(s) with Stock
+    15,  # Multi-Leg Auto-Electronic Trade
+    17,  # Multi-Leg Cross
+    19,  # Multi-Leg Floor Trade
+    21,  # Multi-Leg Trade
+    22,  # Multi-Leg with Stock
+    27,  # Stock Options Auto-Electronic
+    33,  # Stock Options Trade
+    41,  # Multi-Leg Floor Trade of Proprietary Products
+    44,  # Multi-Leg Auto-Electronic Trade of Proprietary Products
+})
+
+
 @dataclass(frozen=True)
 class StrategyParams:
     # Signal
@@ -24,6 +44,10 @@ class StrategyParams:
 
     # Strike scope: only look at contracts within ±this many dollars of spot
     strike_window: float = 5.0
+
+    # Skip prints whose conditions indicate they're part of a multi-leg /
+    # spread / stock-tied order (not a directional single-leg buy).
+    exclude_multi_leg: bool = True
 
     # P&L measurement: "gross" (option mid-to-mid) or "net" (after fills)
     pnl_mode: Literal["gross", "net"] = "gross"

@@ -3,8 +3,13 @@ from __future__ import annotations
 
 import pandas as pd
 
-from iron_condor.config import StrategyParams
-from iron_condor.orb import _classify_aggressor, _strikes_near_spot
+from iron_condor.config import MULTI_LEG_CONDITION_CODES, StrategyParams
+from iron_condor.orb import (
+    _classify_aggressor,
+    _is_multi_leg,
+    _parse_conditions,
+    _strikes_near_spot,
+)
 
 
 def test_classify_aggressor_buy_when_price_above_open() -> None:
@@ -52,3 +57,28 @@ def test_default_params_size_threshold() -> None:
     assert p.size_threshold == 1500
     assert p.strike_window == 5.0
     assert p.skip_fridays is True
+    assert p.exclude_multi_leg is True
+
+
+def test_parse_conditions_handles_list_and_string() -> None:
+    assert _parse_conditions([1, 152]) == {1, 152}
+    assert _parse_conditions("[1, 152]") == {1, 152}
+    assert _parse_conditions("[]") == set()
+    assert _parse_conditions("") == set()
+    assert _parse_conditions(None) == set()
+    assert _parse_conditions("nan") == set()
+    assert _parse_conditions("garbage") == set()
+
+
+def test_is_multi_leg_flags_known_codes() -> None:
+    # Pick any code from the canonical set.
+    leg_code = next(iter(MULTI_LEG_CONDITION_CODES))
+    assert _is_multi_leg([1, leg_code]) is True
+    assert _is_multi_leg(f"[1, {leg_code}]") is True
+
+
+def test_is_multi_leg_passes_single_leg_prints() -> None:
+    assert _is_multi_leg([1]) is False
+    assert _is_multi_leg("[1, 2]") is False
+    assert _is_multi_leg(None) is False
+    assert _is_multi_leg("[]") is False
