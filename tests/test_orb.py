@@ -110,7 +110,7 @@ def test_default_rsi_filter_settings() -> None:
     p = StrategyParams()
     assert p.rsi_filter_enabled is True
     assert p.rsi_period == 14
-    assert p.rsi_candle_minutes == 5
+    assert p.rsi_lookback_minutes == 5
     assert p.rsi_min == 30.0
     assert p.rsi_max == 70.0
 

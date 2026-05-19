@@ -178,26 +178,31 @@ def find_signal(
                 return None
             spot = float(entry_open)
 
-            # RSI extreme filter — check RSI at the close of the 2nd 20-min
-            # candle (= entry_ts). Use rsi_candle_minutes-bar same-day closes.
+            # RSI extreme filter — compute RSI on 1-min closes and check
+            # whether any value within the last rsi_lookback_minutes 1-min
+            # bars of the 2nd 20-min candle is outside [rsi_min, rsi_max].
+            # That window is [entry_ts - rsi_lookback_minutes, entry_ts).
             if params.rsi_filter_enabled:
-                rsi_bars = _aggregate_candles(et, params.rsi_candle_minutes)
-                if not rsi_bars.empty:
-                    rsi_series = _wilder_rsi(rsi_bars["close"], period=params.rsi_period)
-                    rsi_label = entry_ts - pd.Timedelta(minutes=params.rsi_candle_minutes)
-                    try:
-                        rsi_val = float(rsi_series.loc[rsi_label])
-                    except KeyError:
-                        rsi_val = float("nan")
-                    if not pd.isna(rsi_val):
-                        if rsi_val > params.rsi_max or rsi_val < params.rsi_min:
-                            log.debug(
-                                "%s SKIP @ %s: RSI(%d,%dm)=%.1f outside [%.0f, %.0f]",
-                                day, entry_ts.time(),
-                                params.rsi_period, params.rsi_candle_minutes,
-                                rsi_val, params.rsi_min, params.rsi_max,
-                            )
-                            return None
+                rsi_series = _wilder_rsi(et["close"], period=params.rsi_period)
+                window_start = entry_ts - pd.Timedelta(minutes=params.rsi_lookback_minutes)
+                window_mask = (rsi_series.index >= window_start) & (rsi_series.index < entry_ts)
+                window_rsi = rsi_series[window_mask].dropna()
+                if not window_rsi.empty:
+                    extreme = window_rsi[
+                        (window_rsi > params.rsi_max) | (window_rsi < params.rsi_min)
+                    ]
+                    if not extreme.empty:
+                        bad_ts = extreme.index[0]
+                        bad_val = float(extreme.iloc[0])
+                        log.debug(
+                            "%s SKIP @ %s: RSI(%d,1m) hit %.1f at %s "
+                            "(outside [%.0f, %.0f]) within last %d min",
+                            day, entry_ts.time(),
+                            params.rsi_period, bad_val, bad_ts.time(),
+                            params.rsi_min, params.rsi_max,
+                            params.rsi_lookback_minutes,
+                        )
+                        return None
 
             right = "C" if this_dir == "green" else "P"
             strike = _nearest_atm_strike(spot, step=params.strike_step)

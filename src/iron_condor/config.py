@@ -32,12 +32,12 @@ class StrategyParams:
     latest_entry: time = time(12, 30)      # 12:30 ET == 9:30 PT
 
     # -- RSI extreme filter --
-    # If RSI(rsi_period) on rsi_candle_minutes-bar SPY closes (same-day) is
-    # outside [rsi_min, rsi_max] AT the close of the 2nd 20-min trigger candle,
-    # skip the trade. Filter is silently bypassed if RSI hasn't warmed up yet.
+    # Compute Wilder RSI(rsi_period) on same-day SPY 1-min closes. Over the
+    # last rsi_lookback_minutes 1-min bars of the 2nd 20-min trigger candle,
+    # if ANY RSI value is outside [rsi_min, rsi_max], skip the trade.
     rsi_filter_enabled: bool = True
     rsi_period: int = 14
-    rsi_candle_minutes: int = 5
+    rsi_lookback_minutes: int = 5
     rsi_min: float = 30.0
     rsi_max: float = 70.0
 
