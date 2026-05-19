@@ -57,7 +57,9 @@ def summarize_run(trades: pd.DataFrame, starting_balance: float) -> dict:
             "time_exits": 0,
             "hard_close_exits": 0,
             "skipped_vix": int((trades["exit_reason"] == "vix_filter").sum()),
+            "skipped_overnight": int((trades["exit_reason"] == "overnight_filter").sum()),
             "skipped_premarket": int((trades["exit_reason"] == "premarket_filter").sum()),
+            "skipped_combined": int((trades["exit_reason"] == "regime_filter").sum()),
         }
 
     ending = float(taken["balance_after"].iloc[-1])
@@ -82,7 +84,9 @@ def summarize_run(trades: pd.DataFrame, starting_balance: float) -> dict:
         "time_exits": int((taken["exit_reason"] == "time_stop").sum()),
         "hard_close_exits": int((taken["exit_reason"] == "hard_close").sum()),
         "skipped_vix": int((trades["exit_reason"] == "vix_filter").sum()),
+        "skipped_overnight": int((trades["exit_reason"] == "overnight_filter").sum()),
         "skipped_premarket": int((trades["exit_reason"] == "premarket_filter").sum()),
+        "skipped_combined": int((trades["exit_reason"] == "regime_filter").sum()),
     }
 
 
@@ -107,7 +111,9 @@ def summarize_sweep(sweep: pd.DataFrame, starting_balance: float) -> pd.DataFram
         "time_exits",
         "hard_close_exits",
         "skipped_vix",
+        "skipped_overnight",
         "skipped_premarket",
+        "skipped_combined",
         "n_days",
     ]
     return df[cols].sort_values("total_return_pct", ascending=False)

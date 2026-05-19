@@ -33,11 +33,18 @@ class StrategyParams:
     # VIX: skip the day if prior trading day's VIX close was above vix_max.
     vix_filter_enabled: bool = True
     vix_max: float = 22.0
-    # Premarket filter: skip the day if SPY's % change from 9:00 ET (6:00 PT)
-    # to 9:30 ET (6:30 PT) is below premarket_min_pct. Captures last-30-min-of-
-    # premarket weakness, which is the bucket that breaks put credit spreads.
-    premarket_filter_enabled: bool = True
+    # Overnight gap filter: skip if (today_9:30_open - prior_16:00_close) /
+    # prior_close is below overnight_min_pct. Captures big overnight selloffs.
+    overnight_filter_enabled: bool = False
+    overnight_min_pct: float = -0.005
+    # Premarket filter: skip if SPY's % change from 9:00 ET (6:00 PT) to 9:30 ET
+    # (6:30 PT) is below premarket_min_pct. Captures last-30-min-of-premarket
+    # weakness specifically.
+    premarket_filter_enabled: bool = False
     premarket_min_pct: float = -0.005
+    # When BOTH overnight and premarket filters are enabled, this controls the
+    # combine logic: 'any' = skip if either fires; 'all' = skip only if both fire.
+    filter_combine: Literal["any", "all"] = "any"
 
     # -- Exits --
     profit_target_pct: float = 0.50        # % of credit captured to take profit
@@ -57,3 +64,13 @@ SHORT_OTM_PCTS: tuple[float, ...] = (0.005, 0.010, 0.015, 0.020)
 SPREAD_WIDTHS: tuple[float, ...] = (2.0, 5.0)
 PROFIT_TARGETS: tuple[float, ...] = (0.25, 0.50, 0.75)
 STOP_LOSS_MULTS: tuple[float, ...] = (1.5, 2.0, 3.0)
+
+# Regime filter modes — (label, overnight_on, premarket_on, combine_logic)
+# Used as a sweep dimension to compare overnight vs premarket vs combined.
+FILTER_MODES: tuple[tuple[str, bool, bool, str], ...] = (
+    ("none",      False, False, "any"),
+    ("overnight", True,  False, "any"),
+    ("premarket", False, True,  "any"),
+    ("either",    True,  True,  "any"),
+    ("both",      True,  True,  "all"),
+)

@@ -25,6 +25,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from .config import (
+    FILTER_MODES,
     PROFIT_TARGETS,
     SHORT_OTM_PCTS,
     SPREAD_WIDTHS,
@@ -112,6 +113,26 @@ def _prior_trading_day(day: date) -> date:
     return (pd.Timestamp(day) - pd.tseries.offsets.BusinessDay(1)).date()
 
 
+def _spy_prior_close(client: PolygonClient, day: date) -> float | None:
+    """Return SPY's prior trading day regular-session close (16:00 ET), or None."""
+    prior = _prior_trading_day(day)
+    bars = client.get_minute_bars(UNDERLYING, prior)
+    if bars.empty:
+        return None
+    et = bars.copy()
+    et.index = bars.index.tz_convert("America/New_York")
+    rth = et[
+        (et.index.time >= time(9, 30))
+        & (et.index.time < time(16, 0))
+    ]
+    if rth.empty:
+        return None
+    last = rth.iloc[-1]["close"]
+    if pd.isna(last):
+        return None
+    return float(last)
+
+
 def _spy_premarket_change(et_bars: pd.DataFrame, day: date) -> float | None:
     """Return SPY's % change between 9:00 ET (6:00 PT) and 9:30 ET (6:30 PT)
     on `day`, computed against the 1-min bars in `et_bars` (ET-indexed).
@@ -150,17 +171,54 @@ def simulate_day(
                       day, vix, params.vix_max)
             return _empty_result(day, params, balance, "vix_filter")
 
-    # Regime filter: SPY premarket move from 9:00 ET to 9:30 ET
+    # Regime filters: overnight gap and/or premarket move
+    et = today_bars.copy()
+    et.index = today_bars.index.tz_convert("America/New_York")
+
+    overnight_fires = False
+    premarket_fires = False
+    overnight_pct: float | None = None
+    premarket_pct: float | None = None
+
+    if params.overnight_filter_enabled:
+        prior_close = _spy_prior_close(client, day)
+        if prior_close is not None:
+            today_open_bars = et[et.index.time == time(9, 30)]
+            if not today_open_bars.empty:
+                today_open = float(today_open_bars.iloc[0]["open"])
+                overnight_pct = (today_open - prior_close) / prior_close
+                if overnight_pct < params.overnight_min_pct:
+                    overnight_fires = True
+
     if params.premarket_filter_enabled:
-        et = today_bars.copy()
-        et.index = today_bars.index.tz_convert("America/New_York")
-        pm_change = _spy_premarket_change(et, day)
-        if pm_change is not None and pm_change < params.premarket_min_pct:
-            log.debug(
-                "%s: premarket 9:00->9:30 move %.3f%% below threshold %.3f%%, skipping",
-                day, pm_change * 100, params.premarket_min_pct * 100,
-            )
-            return _empty_result(day, params, balance, "premarket_filter")
+        pm = _spy_premarket_change(et, day)
+        if pm is not None:
+            premarket_pct = pm
+            if pm < params.premarket_min_pct:
+                premarket_fires = True
+
+    if params.overnight_filter_enabled and params.premarket_filter_enabled:
+        skip = (overnight_fires or premarket_fires
+                if params.filter_combine == "any"
+                else (overnight_fires and premarket_fires))
+    else:
+        skip = overnight_fires or premarket_fires
+
+    if skip:
+        if overnight_fires and not premarket_fires:
+            reason = "overnight_filter"
+        elif premarket_fires and not overnight_fires:
+            reason = "premarket_filter"
+        else:
+            reason = "regime_filter"
+        log.debug(
+            "%s: skip via %s (overnight=%s, premarket=%s, combine=%s)",
+            day, reason,
+            f"{overnight_pct * 100:.2f}%" if overnight_pct is not None else "n/a",
+            f"{premarket_pct * 100:.2f}%" if premarket_pct is not None else "n/a",
+            params.filter_combine,
+        )
+        return _empty_result(day, params, balance, reason)
 
     contracts = client.get_option_contracts(UNDERLYING, day)  # 0DTE
     if not contracts:
@@ -280,6 +338,17 @@ def simulate_day(
     )
 
 
+def _filter_mode_label(params: StrategyParams) -> str:
+    o, p = params.overnight_filter_enabled, params.premarket_filter_enabled
+    if not o and not p:
+        return "none"
+    if o and not p:
+        return "overnight"
+    if p and not o:
+        return "premarket"
+    return "either" if params.filter_combine == "any" else "both"
+
+
 def run_backtest(
     params: StrategyParams,
     start: date,
@@ -291,7 +360,8 @@ def run_backtest(
     balance = params.starting_balance
     results: list[TradeResult] = []
     desc = (
-        f"otm{int(params.short_otm_pct * 1000)/10:.1f}|w{int(params.spread_width)}"
+        f"{_filter_mode_label(params)}"
+        f"|otm{int(params.short_otm_pct * 1000)/10:.1f}|w{int(params.spread_width)}"
         f"|pt{int(params.profit_target_pct * 100)}|sl{params.stop_loss_mult:g}x"
     )
     for day in tqdm(days, desc=desc):
@@ -308,6 +378,7 @@ def run_sweep(
     spread_widths: Iterable[float] = SPREAD_WIDTHS,
     profit_targets: Iterable[float] = PROFIT_TARGETS,
     stop_loss_mults: Iterable[float] = STOP_LOSS_MULTS,
+    filter_modes: Iterable[tuple[str, bool, bool, str]] = FILTER_MODES,
     base_params: StrategyParams | None = None,
     client: PolygonClient | None = None,
 ) -> pd.DataFrame:
@@ -315,12 +386,14 @@ def run_sweep(
     base = base_params or StrategyParams()
     all_rows: list[pd.DataFrame] = []
 
-    combos = [(otm, w, pt, sl)
+    combos = [(mode_label, on_off, otm, w, pt, sl)
+              for mode_label, *on_off in filter_modes
               for otm in short_otm_pcts
               for w in spread_widths
               for pt in profit_targets
               for sl in stop_loss_mults]
-    for otm, w, pt, sl in combos:
+    for mode_label, on_off, otm, w, pt, sl in combos:
+        overnight_on, premarket_on, combine = on_off
         params = StrategyParams(
             entry_time=base.entry_time,
             hard_close=base.hard_close,
@@ -329,8 +402,11 @@ def run_sweep(
             strike_step=base.strike_step,
             vix_filter_enabled=base.vix_filter_enabled,
             vix_max=base.vix_max,
-            premarket_filter_enabled=base.premarket_filter_enabled,
+            overnight_filter_enabled=overnight_on,
+            overnight_min_pct=base.overnight_min_pct,
+            premarket_filter_enabled=premarket_on,
             premarket_min_pct=base.premarket_min_pct,
+            filter_combine=combine,  # type: ignore[arg-type]
             profit_target_pct=pt,
             stop_loss_mult=sl,
             commission_per_contract=base.commission_per_contract,
@@ -340,7 +416,7 @@ def run_sweep(
         )
         df = run_backtest(params, start, end, client=client)
         df["config"] = (
-            f"otm{int(otm * 1000)/10:.1f}|w{int(w)}"
+            f"{mode_label}|otm{int(otm * 1000)/10:.1f}|w{int(w)}"
             f"|pt{int(pt * 100)}|sl{sl:g}x"
         )
         all_rows.append(df)
