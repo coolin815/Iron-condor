@@ -99,6 +99,17 @@ def _candle_direction(open_: float, close: float) -> str | None:
     return None  # doji — breaks the streak
 
 
+def _wilder_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder RSI on a close-price series (EMA smoothing, alpha = 1/period)."""
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
 # ---------------------------------------------------------------------------
 # Signal detection
 # ---------------------------------------------------------------------------
@@ -166,6 +177,28 @@ def find_signal(
             if entry_open is None or pd.isna(entry_open):
                 return None
             spot = float(entry_open)
+
+            # RSI extreme filter — check RSI at the close of the 2nd 20-min
+            # candle (= entry_ts). Use rsi_candle_minutes-bar same-day closes.
+            if params.rsi_filter_enabled:
+                rsi_bars = _aggregate_candles(et, params.rsi_candle_minutes)
+                if not rsi_bars.empty:
+                    rsi_series = _wilder_rsi(rsi_bars["close"], period=params.rsi_period)
+                    rsi_label = entry_ts - pd.Timedelta(minutes=params.rsi_candle_minutes)
+                    try:
+                        rsi_val = float(rsi_series.loc[rsi_label])
+                    except KeyError:
+                        rsi_val = float("nan")
+                    if not pd.isna(rsi_val):
+                        if rsi_val > params.rsi_max or rsi_val < params.rsi_min:
+                            log.debug(
+                                "%s SKIP @ %s: RSI(%d,%dm)=%.1f outside [%.0f, %.0f]",
+                                day, entry_ts.time(),
+                                params.rsi_period, params.rsi_candle_minutes,
+                                rsi_val, params.rsi_min, params.rsi_max,
+                            )
+                            return None
+
             right = "C" if this_dir == "green" else "P"
             strike = _nearest_atm_strike(spot, step=params.strike_step)
 

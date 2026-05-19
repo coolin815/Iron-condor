@@ -16,6 +16,7 @@ from iron_condor.orb import (
     _candle_direction,
     _expiry_for_dte,
     _nearest_atm_strike,
+    _wilder_rsi,
 )
 
 
@@ -94,6 +95,24 @@ def test_aggregate_candles_drops_premarket_bars() -> None:
     assert len(agg) == 2
     assert agg.index[0].hour == 9 and agg.index[0].minute == 30
     assert agg.index[1].hour == 9 and agg.index[1].minute == 50
+
+
+def test_wilder_rsi_extremes() -> None:
+    # Strictly increasing -> RSI -> 100
+    up = pd.Series([float(i) for i in range(1, 30)])
+    assert _wilder_rsi(up, period=14).iloc[-1] > 90.0
+    # Strictly decreasing -> RSI -> 0
+    down = pd.Series([float(30 - i) for i in range(30)])
+    assert _wilder_rsi(down, period=14).iloc[-1] < 10.0
+
+
+def test_default_rsi_filter_settings() -> None:
+    p = StrategyParams()
+    assert p.rsi_filter_enabled is True
+    assert p.rsi_period == 14
+    assert p.rsi_candle_minutes == 5
+    assert p.rsi_min == 30.0
+    assert p.rsi_max == 70.0
 
 
 def test_sweep_grid_dimensions() -> None:

@@ -31,6 +31,16 @@ class StrategyParams:
     candle_minutes: int = 20
     latest_entry: time = time(12, 30)      # 12:30 ET == 9:30 PT
 
+    # -- RSI extreme filter --
+    # If RSI(rsi_period) on rsi_candle_minutes-bar SPY closes (same-day) is
+    # outside [rsi_min, rsi_max] AT the close of the 2nd 20-min trigger candle,
+    # skip the trade. Filter is silently bypassed if RSI hasn't warmed up yet.
+    rsi_filter_enabled: bool = True
+    rsi_period: int = 14
+    rsi_candle_minutes: int = 5
+    rsi_min: float = 30.0
+    rsi_max: float = 70.0
+
     # -- Contract selection --
     dte: int = 0                           # 0 (today's expiry) or 2 (today + 2 BD)
     strike_step: float = 1.0               # SPY $1 strikes at ATM
