@@ -87,7 +87,7 @@ def test_is_multi_leg_passes_single_leg_prints() -> None:
 def test_default_signal_mode_is_single_print() -> None:
     p = StrategyParams()
     assert p.signal_mode == "single_print"
-    assert p.cluster_min_trades == 4
+    assert p.cluster_min_trades == 3
 
 
 def test_clustered_params_accept_override() -> None:

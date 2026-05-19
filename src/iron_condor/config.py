@@ -57,7 +57,7 @@ class StrategyParams:
     #                    same 1-min candle. Catches sweep orders that get
     #                    broken up across exchanges.
     signal_mode: Literal["single_print", "clustered"] = "single_print"
-    cluster_min_trades: int = 4
+    cluster_min_trades: int = 3
 
     # P&L measurement: "gross" (option mid-to-mid) or "net" (after fills)
     pnl_mode: Literal["gross", "net"] = "gross"

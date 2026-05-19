@@ -87,9 +87,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="Trigger logic. single_print: one print >= size_threshold. "
                         "clustered: >= cluster_min_trades prints >= size_threshold on "
                         "the same contract in the same 1-min candle.")
-    p.add_argument("--cluster-min-trades", type=int, default=4,
+    p.add_argument("--cluster-min-trades", type=int, default=3,
                    help="For --signal-mode clustered: minimum prints in a 1-min "
-                        "candle to fire. Default 4.")
+                        "candle to fire. Default 3.")
     p.add_argument("--include-fridays", action="store_true",
                    help="Override the default Friday-skip rule.")
 
