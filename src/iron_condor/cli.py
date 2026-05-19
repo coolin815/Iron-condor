@@ -18,6 +18,9 @@ import pandas as pd
 
 from .backtest import run_backtest, run_sweep, simulate_day
 from .config import (
+    CLUSTER_PROFIT_TARGETS,
+    CLUSTER_SIZE_THRESHOLDS,
+    CLUSTER_STOP_LOSSES,
     PROFIT_TARGETS,
     SIZE_THRESHOLDS,
     STOP_LOSSES,
@@ -79,6 +82,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--entry-mode", choices=["instant", "next_bar_open"], action="append",
                    help="Entry timing: instant (fill at print + spread) or next_bar_open "
                         "(fill at next minute's open). Default: sweep both.")
+    p.add_argument("--signal-mode", choices=["single_print", "clustered"],
+                   default="single_print",
+                   help="Trigger logic. single_print: one print >= size_threshold. "
+                        "clustered: >= cluster_min_trades prints >= size_threshold on "
+                        "the same contract in the same 1-min candle.")
+    p.add_argument("--cluster-min-trades", type=int, default=4,
+                   help="For --signal-mode clustered: minimum prints in a 1-min "
+                        "candle to fire. Default 4.")
     p.add_argument("--include-fridays", action="store_true",
                    help="Override the default Friday-skip rule.")
 
@@ -94,6 +105,8 @@ def main(argv: list[str] | None = None) -> int:
     # For smoke / single-config use first size threshold passed if any
     if args.size_threshold:
         overrides["size_threshold"] = args.size_threshold[0]
+    overrides["signal_mode"] = args.signal_mode
+    overrides["cluster_min_trades"] = args.cluster_min_trades
     base_params = StrategyParams(**overrides)
 
     if args.smoke:
@@ -128,15 +141,26 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.sweep:
         from .config import ENTRY_MODES
-        size_thresholds = args.size_threshold or list(SIZE_THRESHOLDS)
-        pts = args.pt or list(PROFIT_TARGETS)
-        sls = args.sl or list(STOP_LOSSES)
+        if args.signal_mode == "clustered":
+            default_sizes = list(CLUSTER_SIZE_THRESHOLDS)
+            default_pts = list(CLUSTER_PROFIT_TARGETS)
+            default_sls = list(CLUSTER_STOP_LOSSES)
+        else:
+            default_sizes = list(SIZE_THRESHOLDS)
+            default_pts = list(PROFIT_TARGETS)
+            default_sls = list(STOP_LOSSES)
+        size_thresholds = args.size_threshold or default_sizes
+        pts = args.pt or default_pts
+        sls = args.sl or default_sls
         pnl_modes = args.pnl_mode or [base_params.pnl_mode]
         entry_modes = args.entry_mode or list(ENTRY_MODES)
         n = (len(size_thresholds) * len(pts) * len(sls)
              * len(pnl_modes) * len(entry_modes))
+        mode_str = args.signal_mode
+        if mode_str == "clustered":
+            mode_str += f" (n>={args.cluster_min_trades})"
         print(
-            f"Sweep: {n} configs (size_threshold={size_thresholds}, "
+            f"Sweep [{mode_str}]: {n} configs (size_threshold={size_thresholds}, "
             f"pt={pts}, sl={sls}, pnl={pnl_modes}, "
             f"entry_mode={entry_modes}, "
             f"strike_window=±${base_params.strike_window})"

@@ -315,11 +315,22 @@ def run_sweep(
             leg_half_spread=base.leg_half_spread,
             starting_balance=base.starting_balance,
             max_capital_per_trade=base.max_capital_per_trade,
+            exclude_multi_leg=base.exclude_multi_leg,
+            signal_mode=base.signal_mode,
+            cluster_min_trades=base.cluster_min_trades,
         )
         df = run_backtest(params, start, end, client=client)
-        df["config"] = (
-            f"sz{sz}|pt{int(pt*100)}|sl{int(sl*100)}"
-            f"|em={em[:4]}|pnl={pm}"
-        )
+        if base.signal_mode == "clustered":
+            cfg = (
+                f"sz{sz}|n{base.cluster_min_trades}"
+                f"|pt{int(pt*100)}|sl{int(sl*100)}"
+                f"|em={em[:4]}|pnl={pm}|mode=clust"
+            )
+        else:
+            cfg = (
+                f"sz{sz}|pt{int(pt*100)}|sl{int(sl*100)}"
+                f"|em={em[:4]}|pnl={pm}"
+            )
+        df["config"] = cfg
         all_rows.append(df)
     return pd.concat(all_rows, ignore_index=True)

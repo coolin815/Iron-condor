@@ -49,6 +49,16 @@ class StrategyParams:
     # spread / stock-tied order (not a directional single-leg buy).
     exclude_multi_leg: bool = True
 
+    # Signal mode:
+    #   "single_print" — one print of size >= size_threshold fires the signal
+    #                    (the original logic; default).
+    #   "clustered"    — at least `cluster_min_trades` buy-aggressor prints of
+    #                    size >= size_threshold on the SAME contract within the
+    #                    same 1-min candle. Catches sweep orders that get
+    #                    broken up across exchanges.
+    signal_mode: Literal["single_print", "clustered"] = "single_print"
+    cluster_min_trades: int = 4
+
     # P&L measurement: "gross" (option mid-to-mid) or "net" (after fills)
     pnl_mode: Literal["gross", "net"] = "gross"
 
@@ -73,8 +83,13 @@ class StrategyParams:
     max_capital_per_trade: float = 50000.0
 
 
-# Sweep grids
+# Sweep grids — single_print mode (default)
 SIZE_THRESHOLDS: tuple[int, ...] = (2000, 2500, 3000, 3500, 4000)
 PROFIT_TARGETS: tuple[float, ...] = (0.05, 0.10, 0.15)
 STOP_LOSSES: tuple[float, ...] = (0.10, 0.15, 0.20, 0.25, 0.30)
 ENTRY_MODES: tuple[str, ...] = ("instant", "next_bar_open")
+
+# Sweep grids — clustered mode (--signal-mode clustered)
+CLUSTER_SIZE_THRESHOLDS: tuple[int, ...] = (2500, 3000, 3500, 4000, 4500, 5000)
+CLUSTER_PROFIT_TARGETS: tuple[float, ...] = (0.05, 0.10, 0.15)
+CLUSTER_STOP_LOSSES: tuple[float, ...] = (0.20, 0.25, 0.30, 0.40, 0.50)

@@ -141,6 +141,23 @@ def find_signal(
     params: StrategyParams,
     underlying: str = "SPY",
 ) -> Signal | None:
+    """Dispatch to the single_print or clustered scanner per params.signal_mode."""
+    if params.signal_mode == "clustered":
+        return _find_clustered_signal(
+            today_1min_spy, contracts, client, params, underlying
+        )
+    return _find_single_print_signal(
+        today_1min_spy, contracts, client, params, underlying
+    )
+
+
+def _find_single_print_signal(
+    today_1min_spy: pd.DataFrame,
+    contracts: list[dict],
+    client: PolygonClient,
+    params: StrategyParams,
+    underlying: str = "SPY",
+) -> Signal | None:
     """Scan ATM-area 0DTE trade tape for the first large BUY-aggressor print
     inside the entry window."""
     if today_1min_spy.empty:
@@ -236,6 +253,126 @@ def find_signal(
             "%s: %d large prints, %d filtered as multi-leg",
             day, n_large, n_multi_leg,
         )
+    if best is None:
+        return None
+    return best[1]
+
+
+def _find_clustered_signal(
+    today_1min_spy: pd.DataFrame,
+    contracts: list[dict],
+    client: PolygonClient,
+    params: StrategyParams,
+    underlying: str = "SPY",
+) -> Signal | None:
+    """Scan ATM-area 0DTE trade tape for the first 1-min candle on a single
+    contract containing >= params.cluster_min_trades buy-aggressor prints of
+    size >= params.size_threshold."""
+    if today_1min_spy.empty:
+        return None
+    if params.skip_fridays:
+        day = today_1min_spy.index[0].tz_convert("America/New_York").date()
+        if _is_friday(day):
+            return None
+    day = today_1min_spy.index[0].tz_convert("America/New_York").date()
+
+    et = _to_et(today_1min_spy)
+    open_bar = et[et.index.time == time(9, 30)]
+    if open_bar.empty:
+        return None
+    spot_at_open = float(open_bar.iloc[0]["close"])
+
+    nearby = _strikes_near_spot(spot_at_open, contracts, window=5.0)
+    if not nearby:
+        return None
+
+    earliest = params.earliest_entry
+    latest = params.latest_entry
+    threshold = params.size_threshold
+    min_count = max(1, int(params.cluster_min_trades))
+
+    best: tuple[pd.Timestamp, Signal] | None = None
+    n_clusters_found = 0
+    for c in nearby:
+        try:
+            strike = float(c["strike_price"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        ctype = c.get("contract_type", "").lower()
+        if ctype not in ("call", "put"):
+            continue
+        right = "C" if ctype == "call" else "P"
+        ticker = build_option_ticker(underlying, day, right, strike)
+
+        trades = client.get_option_trades(ticker, day)
+        if trades.empty:
+            continue
+        big = trades[trades["size"] >= threshold]
+        if big.empty:
+            continue
+
+        bars = client.get_option_minute_bars(ticker, day)
+        if bars.empty:
+            continue
+        bars = _to_et(bars)
+
+        # Build per-minute groups of qualifying buy-aggressor prints.
+        by_minute: dict[pd.Timestamp, list[dict]] = {}
+        for _, row in big.iterrows():
+            if params.exclude_multi_leg and _is_multi_leg(row.get("conditions")):
+                continue
+            ts_ns = int(row["sip_timestamp_ns"])
+            ts = pd.Timestamp(ts_ns, unit="ns", tz="UTC").tz_convert("America/New_York")
+            tt = ts.time()
+            if tt < earliest or tt > latest:
+                continue
+            minute = ts.floor("min")
+            try:
+                bar = bars.loc[minute]
+            except KeyError:
+                continue
+            bar_open = float(bar["open"]) if not pd.isna(bar["open"]) else None
+            trade_price = float(row["price"])
+            if _classify_aggressor(trade_price, bar_open) != "buy":
+                continue
+            by_minute.setdefault(minute, []).append({
+                "ts": ts,
+                "price": trade_price,
+                "size": int(row["size"]),
+                "bar_open": bar_open,
+            })
+
+        # Earliest minute on this contract with >= min_count qualifying prints.
+        qualifying = sorted(
+            (m for m, rs in by_minute.items() if len(rs) >= min_count)
+        )
+        if not qualifying:
+            continue
+        minute = qualifying[0]
+        rows_sorted = sorted(by_minute[minute], key=lambda r: r["ts"])
+        trigger = rows_sorted[-1]  # last print in the cluster
+        n_clusters_found += 1
+
+        total_size = sum(r["size"] for r in by_minute[minute])
+        entry_minute = minute + pd.Timedelta(minutes=1)
+        sig = Signal(
+            timestamp=entry_minute,
+            print_timestamp=trigger["ts"],
+            contract=ticker,
+            strike=strike,
+            right=right,
+            size=total_size,  # combined size across the cluster
+            trade_price=trigger["price"],
+            bar_open=(
+                trigger["bar_open"]
+                if trigger["bar_open"] is not None
+                else float("nan")
+            ),
+        )
+        if best is None or trigger["ts"] < best[0]:
+            best = (trigger["ts"], sig)
+
+    log.debug("%s: %d clustered candles found (min_count=%d)", day, n_clusters_found, min_count)
     if best is None:
         return None
     return best[1]
