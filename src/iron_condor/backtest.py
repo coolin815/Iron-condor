@@ -112,24 +112,24 @@ def _prior_trading_day(day: date) -> date:
     return (pd.Timestamp(day) - pd.tseries.offsets.BusinessDay(1)).date()
 
 
-def _spy_prior_close(client: PolygonClient, day: date) -> float | None:
-    """Return SPY's prior trading day regular-session close, or None."""
-    prior = _prior_trading_day(day)
-    bars = client.get_minute_bars(UNDERLYING, prior)
-    if bars.empty:
+def _spy_premarket_change(et_bars: pd.DataFrame, day: date) -> float | None:
+    """Return SPY's % change between 9:00 ET (6:00 PT) and 9:30 ET (6:30 PT)
+    on `day`, computed against the 1-min bars in `et_bars` (ET-indexed).
+    Returns None if either bar is missing."""
+    start_ts = pd.Timestamp(
+        datetime.combine(day, time(9, 0))
+    ).tz_localize("America/New_York")
+    end_ts = pd.Timestamp(
+        datetime.combine(day, time(9, 30))
+    ).tz_localize("America/New_York")
+    try:
+        start_price = float(et_bars.loc[start_ts, "open"])
+        end_price = float(et_bars.loc[end_ts, "open"])
+    except KeyError:
         return None
-    et = bars.copy()
-    et.index = bars.index.tz_convert("America/New_York")
-    rth = et[
-        (et.index.time >= time(9, 30))
-        & (et.index.time < time(16, 0))
-    ]
-    if rth.empty:
+    if pd.isna(start_price) or pd.isna(end_price) or start_price <= 0:
         return None
-    last = rth.iloc[-1]["close"]
-    if pd.isna(last):
-        return None
-    return float(last)
+    return (end_price - start_price) / start_price
 
 
 def simulate_day(
@@ -150,22 +150,17 @@ def simulate_day(
                       day, vix, params.vix_max)
             return _empty_result(day, params, balance, "vix_filter")
 
-    # Regime filter: SPY overnight gap (today's 9:30 open vs prior 16:00 close)
-    if params.gap_filter_enabled:
-        prior_close = _spy_prior_close(client, day)
-        if prior_close is not None:
-            et = today_bars.copy()
-            et.index = today_bars.index.tz_convert("America/New_York")
-            today_open_bars = et[et.index.time == time(9, 30)]
-            if not today_open_bars.empty:
-                today_open = float(today_open_bars.iloc[0]["open"])
-                gap_pct = (today_open - prior_close) / prior_close
-                if gap_pct < params.gap_min_pct:
-                    log.debug(
-                        "%s: gap %.3f%% below threshold %.3f%%, skipping",
-                        day, gap_pct * 100, params.gap_min_pct * 100,
-                    )
-                    return _empty_result(day, params, balance, "gap_filter")
+    # Regime filter: SPY premarket move from 9:00 ET to 9:30 ET
+    if params.premarket_filter_enabled:
+        et = today_bars.copy()
+        et.index = today_bars.index.tz_convert("America/New_York")
+        pm_change = _spy_premarket_change(et, day)
+        if pm_change is not None and pm_change < params.premarket_min_pct:
+            log.debug(
+                "%s: premarket 9:00->9:30 move %.3f%% below threshold %.3f%%, skipping",
+                day, pm_change * 100, params.premarket_min_pct * 100,
+            )
+            return _empty_result(day, params, balance, "premarket_filter")
 
     contracts = client.get_option_contracts(UNDERLYING, day)  # 0DTE
     if not contracts:
@@ -334,8 +329,8 @@ def run_sweep(
             strike_step=base.strike_step,
             vix_filter_enabled=base.vix_filter_enabled,
             vix_max=base.vix_max,
-            gap_filter_enabled=base.gap_filter_enabled,
-            gap_min_pct=base.gap_min_pct,
+            premarket_filter_enabled=base.premarket_filter_enabled,
+            premarket_min_pct=base.premarket_min_pct,
             profit_target_pct=pt,
             stop_loss_mult=sl,
             commission_per_contract=base.commission_per_contract,

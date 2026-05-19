@@ -33,10 +33,11 @@ class StrategyParams:
     # VIX: skip the day if prior trading day's VIX close was above vix_max.
     vix_filter_enabled: bool = True
     vix_max: float = 22.0
-    # SPY gap: skip the day if (today_open - prior_close) / prior_close is below
-    # gap_min_pct. Negative number = down-gap threshold (e.g. -0.005 = -0.5%).
-    gap_filter_enabled: bool = True
-    gap_min_pct: float = -0.005
+    # Premarket filter: skip the day if SPY's % change from 9:00 ET (6:00 PT)
+    # to 9:30 ET (6:30 PT) is below premarket_min_pct. Captures last-30-min-of-
+    # premarket weakness, which is the bucket that breaks put credit spreads.
+    premarket_filter_enabled: bool = True
+    premarket_min_pct: float = -0.005
 
     # -- Exits --
     profit_target_pct: float = 0.50        # % of credit captured to take profit
