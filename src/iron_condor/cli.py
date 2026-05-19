@@ -90,6 +90,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--cluster-min-trades", type=int, default=3,
                    help="For --signal-mode clustered: minimum prints in a 1-min "
                         "candle to fire. Default 3.")
+    p.add_argument("--exclude-multi-leg", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Filter out prints whose Polygon condition codes mark "
+                        "them as multi-leg/spread. Default on. Pass "
+                        "--no-exclude-multi-leg to disable for A/B testing.")
     p.add_argument("--include-fridays", action="store_true",
                    help="Override the default Friday-skip rule.")
 
@@ -107,6 +112,7 @@ def main(argv: list[str] | None = None) -> int:
         overrides["size_threshold"] = args.size_threshold[0]
     overrides["signal_mode"] = args.signal_mode
     overrides["cluster_min_trades"] = args.cluster_min_trades
+    overrides["exclude_multi_leg"] = args.exclude_multi_leg
     base_params = StrategyParams(**overrides)
 
     if args.smoke:

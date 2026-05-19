@@ -293,6 +293,11 @@ def _find_clustered_signal(
 
     best: tuple[pd.Timestamp, Signal] | None = None
     n_clusters_found = 0
+    n_large_total = 0
+    n_multi_leg_total = 0
+    n_sell_total = 0
+    n_buy_kept_total = 0
+    max_per_minute_seen = 0
     for c in nearby:
         try:
             strike = float(c["strike_price"])
@@ -319,7 +324,9 @@ def _find_clustered_signal(
         # Build per-minute groups of qualifying buy-aggressor prints.
         by_minute: dict[pd.Timestamp, list[dict]] = {}
         for _, row in big.iterrows():
+            n_large_total += 1
             if params.exclude_multi_leg and _is_multi_leg(row.get("conditions")):
+                n_multi_leg_total += 1
                 continue
             ts_ns = int(row["sip_timestamp_ns"])
             ts = pd.Timestamp(ts_ns, unit="ns", tz="UTC").tz_convert("America/New_York")
@@ -333,14 +340,22 @@ def _find_clustered_signal(
                 continue
             bar_open = float(bar["open"]) if not pd.isna(bar["open"]) else None
             trade_price = float(row["price"])
-            if _classify_aggressor(trade_price, bar_open) != "buy":
+            aggressor = _classify_aggressor(trade_price, bar_open)
+            if aggressor != "buy":
+                if aggressor == "sell":
+                    n_sell_total += 1
                 continue
+            n_buy_kept_total += 1
             by_minute.setdefault(minute, []).append({
                 "ts": ts,
                 "price": trade_price,
                 "size": int(row["size"]),
                 "bar_open": bar_open,
             })
+        if by_minute:
+            local_max = max(len(rs) for rs in by_minute.values())
+            if local_max > max_per_minute_seen:
+                max_per_minute_seen = local_max
 
         # Earliest minute on this contract with >= min_count qualifying prints.
         qualifying = sorted(
@@ -372,7 +387,13 @@ def _find_clustered_signal(
         if best is None or trigger["ts"] < best[0]:
             best = (trigger["ts"], sig)
 
-    log.debug("%s: %d clustered candles found (min_count=%d)", day, n_clusters_found, min_count)
+    log.debug(
+        "%s [clustered S>=%d N>=%d]: large=%d multi_leg=%d sell=%d buy_kept=%d "
+        "max_per_minute=%d clusters_found=%d",
+        day, threshold, min_count,
+        n_large_total, n_multi_leg_total, n_sell_total, n_buy_kept_total,
+        max_per_minute_seen, n_clusters_found,
+    )
     if best is None:
         return None
     return best[1]
