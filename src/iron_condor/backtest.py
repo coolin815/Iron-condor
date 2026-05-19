@@ -160,19 +160,21 @@ def simulate_day(
         if mid is None:
             continue
         bid = mid - h
+        # SL is always evaluated on gross (mid-to-mid).
+        gross_pct = (mid - entry_mid) / entry_mid
         if use_net:
             gross_val = (bid - entry_ask) * 100 * qty
             fees_val = 2 * params.commission_per_contract * qty
             net_val = gross_val - fees_val
             capital_deployed = entry_ask * 100 * qty + params.commission_per_contract * qty
-            exit_pct = net_val / capital_deployed
+            pt_pct = net_val / capital_deployed
         else:
-            exit_pct = (mid - entry_mid) / entry_mid
+            pt_pct = gross_pct
 
-        if exit_pct >= params.profit_target_pct:
+        if pt_pct >= params.profit_target_pct:
             exit_ts, exit_bid, exit_reason = ts, bid, "profit"
             break
-        if exit_pct <= -params.stop_loss_pct:
+        if gross_pct <= -params.stop_loss_pct:
             exit_ts, exit_bid, exit_reason = ts, bid, "stop"
             break
 
