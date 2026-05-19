@@ -1,96 +1,82 @@
-"""Tests for the flow-following strategy."""
+"""Tests for the SPY 2DTE momentum-trigger strategy."""
 from __future__ import annotations
+
+from datetime import date
 
 import pandas as pd
 
-from iron_condor.config import MULTI_LEG_CONDITION_CODES, StrategyParams
-from iron_condor.orb import (
-    _classify_aggressor,
-    _is_multi_leg,
-    _parse_conditions,
-    _strikes_near_spot,
+from iron_condor.config import (
+    PROFIT_SCENARIOS,
+    STOP_SCENARIOS,
+    StrategyParams,
 )
+from iron_condor.orb import _one_step_itm_strike, _two_dte_expiry, _wilder_rsi
 
 
-def test_classify_aggressor_buy_when_price_above_open() -> None:
-    assert _classify_aggressor(trade_price=1.10, bar_open=1.05) == "buy"
-    assert _classify_aggressor(trade_price=1.05, bar_open=1.05) == "buy"
-
-
-def test_classify_aggressor_sell_when_price_below_open() -> None:
-    assert _classify_aggressor(trade_price=1.00, bar_open=1.05) == "sell"
-
-
-def test_classify_aggressor_unknown_when_bar_missing() -> None:
-    assert _classify_aggressor(trade_price=1.10, bar_open=None) == "unknown"
-    assert _classify_aggressor(trade_price=1.10, bar_open=float("nan")) == "unknown"
-
-
-def test_strikes_near_spot_filters_by_window() -> None:
-    spot = 580.0
-    contracts = [
-        {"strike_price": 570, "contract_type": "call"},
-        {"strike_price": 578, "contract_type": "call"},
-        {"strike_price": 580, "contract_type": "put"},
-        {"strike_price": 583, "contract_type": "put"},
-        {"strike_price": 590, "contract_type": "call"},
-    ]
-    out = _strikes_near_spot(spot, contracts, window=5.0)
-    strikes = sorted(c["strike_price"] for c in out)
-    assert strikes == [578, 580, 583]  # 570 and 590 are >5 away
-
-
-def test_strikes_near_spot_skips_missing_strike() -> None:
-    contracts = [
-        {"strike_price": None, "contract_type": "call"},
-        {"contract_type": "put"},
-        {"strike_price": "not_a_number", "contract_type": "call"},
-        {"strike_price": 580, "contract_type": "call"},
-    ]
-    out = _strikes_near_spot(580.0, contracts, window=5.0)
-    assert len(out) == 1
-    assert out[0]["strike_price"] == 580
-
-
-def test_default_params_size_threshold() -> None:
+def test_default_params() -> None:
     p = StrategyParams()
-    assert p.size_threshold == 1500
-    assert p.strike_window == 10.0
-    assert p.skip_fridays is True
-    assert p.exclude_multi_leg is True
+    assert p.price_move_threshold == 0.15
+    assert p.rsi_period == 14
+    assert p.rsi_min == 30.0
+    assert p.rsi_max == 70.0
+    assert p.max_attempts == 5
+    assert p.dte == 2
+    assert p.entry_start.hour == 10
+    assert p.entry_start.minute == 34
 
 
-def test_parse_conditions_handles_list_and_string() -> None:
-    assert _parse_conditions([1, 152]) == {1, 152}
-    assert _parse_conditions("[1, 152]") == {1, 152}
-    assert _parse_conditions("[]") == set()
-    assert _parse_conditions("") == set()
-    assert _parse_conditions(None) == set()
-    assert _parse_conditions("nan") == set()
-    assert _parse_conditions("garbage") == set()
+def test_two_dte_skips_weekends() -> None:
+    # Monday 2026-05-11 + 2 business days = Wednesday 2026-05-13
+    assert _two_dte_expiry(date(2026, 5, 11)) == date(2026, 5, 13)
+    # Tuesday -> Thursday
+    assert _two_dte_expiry(date(2026, 5, 12)) == date(2026, 5, 14)
+    # Wednesday -> Friday
+    assert _two_dte_expiry(date(2026, 5, 13)) == date(2026, 5, 15)
+    # Thursday -> Monday (skip weekend)
+    assert _two_dte_expiry(date(2026, 5, 14)) == date(2026, 5, 18)
+    # Friday -> Tuesday (skip weekend)
+    assert _two_dte_expiry(date(2026, 5, 15)) == date(2026, 5, 19)
 
 
-def test_is_multi_leg_flags_known_codes() -> None:
-    # Pick any code from the canonical set.
-    leg_code = next(iter(MULTI_LEG_CONDITION_CODES))
-    assert _is_multi_leg([1, leg_code]) is True
-    assert _is_multi_leg(f"[1, {leg_code}]") is True
+def test_one_step_itm_strike_call_below_spot() -> None:
+    # Spot 590.55 -> 590 call (first strike below)
+    assert _one_step_itm_strike(590.55, "C") == 590.0
+    # Spot 590.01 -> 590 call
+    assert _one_step_itm_strike(590.01, "C") == 590.0
 
 
-def test_is_multi_leg_passes_single_leg_prints() -> None:
-    assert _is_multi_leg([1]) is False
-    assert _is_multi_leg("[1, 2]") is False
-    assert _is_multi_leg(None) is False
-    assert _is_multi_leg("[]") is False
+def test_one_step_itm_strike_call_when_spot_on_strike() -> None:
+    # Spot exactly 590.00 -> 589 (590 is ATM, not ITM)
+    assert _one_step_itm_strike(590.0, "C") == 589.0
 
 
-def test_default_signal_mode_is_single_print() -> None:
-    p = StrategyParams()
-    assert p.signal_mode == "single_print"
-    assert p.cluster_min_trades == 3
+def test_one_step_itm_strike_put_above_spot() -> None:
+    # Spot 590.55 -> 591 put
+    assert _one_step_itm_strike(590.55, "P") == 591.0
+    # Spot 590.99 -> 591 put
+    assert _one_step_itm_strike(590.99, "P") == 591.0
 
 
-def test_clustered_params_accept_override() -> None:
-    p = StrategyParams(signal_mode="clustered", cluster_min_trades=3)
-    assert p.signal_mode == "clustered"
-    assert p.cluster_min_trades == 3
+def test_one_step_itm_strike_put_when_spot_on_strike() -> None:
+    # Spot exactly 590.00 -> 591 (590 is ATM, not ITM)
+    assert _one_step_itm_strike(590.0, "P") == 591.0
+
+
+def test_wilder_rsi_known_values() -> None:
+    # Monotonically increasing prices -> RSI should approach 100
+    close = pd.Series([float(i) for i in range(1, 30)])
+    rsi = _wilder_rsi(close, period=14)
+    assert rsi.iloc[-1] > 90.0
+    # Monotonically decreasing prices -> RSI should approach 0
+    close_down = pd.Series([float(30 - i) for i in range(30)])
+    rsi_down = _wilder_rsi(close_down, period=14)
+    assert rsi_down.iloc[-1] < 10.0
+
+
+def test_sweep_grid_dimensions() -> None:
+    # 3 profit scenarios x 10 stop scenarios = 30 configs
+    assert len(PROFIT_SCENARIOS) == 3
+    assert len(STOP_SCENARIOS) == 10
+    # exactly one of (pct, minutes) is non-zero per stop scenario
+    for sl_pct, sl_min in STOP_SCENARIOS:
+        assert (sl_pct > 0 and sl_min == 0) or (sl_pct == 0 and sl_min > 0)

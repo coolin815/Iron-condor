@@ -1,6 +1,16 @@
-"""Strategy parameters for the SPY 0DTE 'follow the flow' strategy.
+"""Strategy parameters for the SPY 2DTE momentum-trigger strategy.
 
-Copies large BUY-aggressor option prints. Single trade/day, no Fridays.
+Entry trigger (around 10:34 ET / 7:34 PT):
+  - SPY 1-min close vs today's 9:30 ET regular-session open
+  - If close >= open + $0.15  -> 1-step ITM 2DTE CALL
+  - If close <= open - $0.15  -> 1-step ITM 2DTE PUT
+  - RSI(14) on same-day SPY 1-min closes must be 30-70
+  - Try each subsequent minute up to `max_attempts` (default 5) if no entry yet
+
+Exit:
+  - Profit target (PT) hit on mid-to-mid or net-after-fees (per pnl_mode)
+  - Stop loss — either a % loss (gross/net per pnl_mode) OR an N-minute time stop
+  - Hard close at 3:55 PM ET to avoid overnight gap risk
 """
 from __future__ import annotations
 
@@ -11,85 +21,55 @@ from typing import Literal
 UNDERLYING: str = "SPY"
 
 
-# Polygon/OPRA condition codes that indicate a print is part of a
-# multi-leg / complex / spread / stock-tied order. A "buy" print with any
-# of these codes is almost certainly one leg of a vertical, condor,
-# risk-reversal, or stock+option combo — not a directional bet — so we
-# skip it. This list is based on the commonly documented OPRA reference;
-# if the filter is over- or under-aggressive you can adjust the set.
-MULTI_LEG_CONDITION_CODES: frozenset[int] = frozenset({
-    14,  # Multi-Leg Auto-Electronic Trade Against Single-Leg(s) with Stock
-    15,  # Multi-Leg Auto-Electronic Trade
-    17,  # Multi-Leg Cross
-    19,  # Multi-Leg Floor Trade
-    21,  # Multi-Leg Trade
-    22,  # Multi-Leg with Stock
-    27,  # Stock Options Auto-Electronic
-    33,  # Stock Options Trade
-    41,  # Multi-Leg Floor Trade of Proprietary Products
-    44,  # Multi-Leg Auto-Electronic Trade of Proprietary Products
-})
-
-
 @dataclass(frozen=True)
 class StrategyParams:
-    # Signal
-    earliest_entry: time = time(9, 35)     # right after the open
-    latest_entry: time = time(15, 0)       # 12:00 PT — no new entries this late
+    # -- Entry trigger --
+    entry_start: time = time(10, 34)       # 10:34 ET == 7:34 PT
+    max_attempts: int = 5                  # consecutive 1-min checks; give up after
+    price_move_threshold: float = 0.15     # required move vs 9:30 open ($)
+
+    # -- RSI gate --
+    rsi_period: int = 14                   # Wilder, same-day
+    rsi_min: float = 30.0
+    rsi_max: float = 70.0
+
+    # -- Contract selection --
+    dte: int = 2                           # 2 trading days to expiration
+    strike_step: float = 1.0               # SPY $1 strikes at ATM
+
+    # -- Exits --
     hard_close: time = time(15, 55)
-    skip_fridays: bool = True
-
-    # Flow-detection threshold (single print size in contracts)
-    size_threshold: int = 1500
-
-    # Strike scope: only look at contracts within ±this many dollars of spot
-    strike_window: float = 10.0
-
-    # Skip prints whose conditions indicate they're part of a multi-leg /
-    # spread / stock-tied order (not a directional single-leg buy).
-    exclude_multi_leg: bool = True
-
-    # Signal mode:
-    #   "single_print" — one print of size >= size_threshold fires the signal
-    #                    (the original logic; default).
-    #   "clustered"    — at least `cluster_min_trades` buy-aggressor prints of
-    #                    size >= size_threshold on the SAME contract within the
-    #                    same 1-min candle. Catches sweep orders that get
-    #                    broken up across exchanges.
-    signal_mode: Literal["single_print", "clustered"] = "single_print"
-    cluster_min_trades: int = 3
-
-    # P&L measurement: "gross" (option mid-to-mid) or "net" (after fills)
+    profit_target_pct: float = 0.10        # 10% gross by default
+    stop_loss_pct: float = 0.30            # 30% (0 if using time stop)
+    stop_loss_minutes: int = 0             # >0 means time stop, ignore stop_loss_pct
     pnl_mode: Literal["gross", "net"] = "gross"
 
-    # Entry timing:
-    #   "instant"        — fill at print_price + full bid-ask spread (models a
-    #                      WebSocket-driven bot reacting in ~1 sec, paying the
-    #                      ask just above the print)
-    #   "next_bar_open"  — fill at the OPEN of the bar AFTER the print, +
-    #                      half-spread. More conservative (~60s reaction delay).
-    entry_mode: Literal["instant", "next_bar_open"] = "instant"
-
-    # Exits on the option price (single-leg long):
-    profit_target_pct: float = 0.30    # +30% on option mid
-    stop_loss_pct: float = 0.30        # -30% on option mid
-
-    # Execution
+    # -- Execution --
     commission_per_contract: float = 0.85
-    leg_half_spread: float = 0.01      # single-leg ATM bid-ask half
+    leg_half_spread: float = 0.01
 
-    # Account
+    # -- Account --
     starting_balance: float = 1500.0
     max_capital_per_trade: float = 50000.0
 
 
-# Sweep grids — single_print mode (default)
-SIZE_THRESHOLDS: tuple[int, ...] = (2000, 2500, 3000, 3500, 4000)
-PROFIT_TARGETS: tuple[float, ...] = (0.05, 0.10, 0.15)
-STOP_LOSSES: tuple[float, ...] = (0.10, 0.15, 0.20, 0.25, 0.30)
-ENTRY_MODES: tuple[str, ...] = ("instant", "next_bar_open")
+# Sweep grid — (profit_target_pct, pnl_mode) pairs
+PROFIT_SCENARIOS: tuple[tuple[float, str], ...] = (
+    (0.05, "gross"),
+    (0.05, "net"),
+    (0.10, "gross"),
+)
 
-# Sweep grids — clustered mode (--signal-mode clustered)
-CLUSTER_SIZE_THRESHOLDS: tuple[int, ...] = (500, 1000, 1500, 2000, 2500)
-CLUSTER_PROFIT_TARGETS: tuple[float, ...] = (0.05, 0.10, 0.15)
-CLUSTER_STOP_LOSSES: tuple[float, ...] = (0.20, 0.25, 0.30, 0.40, 0.50)
+# Sweep grid — (stop_loss_pct, stop_loss_minutes) pairs. Exactly one is non-zero per row.
+STOP_SCENARIOS: tuple[tuple[float, int], ...] = (
+    (0.20, 0),
+    (0.25, 0),
+    (0.30, 0),
+    (0.35, 0),
+    (0.40, 0),
+    (0.45, 0),
+    (0.50, 0),
+    (0.0, 60),
+    (0.0, 90),
+    (0.0, 120),
+)

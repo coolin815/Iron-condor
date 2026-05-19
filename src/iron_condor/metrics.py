@@ -11,7 +11,7 @@ def analyze_timing(trades: pd.DataFrame) -> pd.DataFrame:
     Use this to set an early time-stop that doesn't kill winners. Returns one
     row per exit_reason with mean / median / quartile minutes_held.
     """
-    df = trades[trades["exit_reason"].isin(["profit", "stop", "time_stop"])].copy()
+    df = trades[trades["exit_reason"].isin(["profit", "stop", "time_stop", "hard_close"])].copy()
     if df.empty:
         return pd.DataFrame()
     # Compute on the fly if minutes_held wasn't materialized (older runs).
@@ -38,7 +38,7 @@ def analyze_timing(trades: pd.DataFrame) -> pd.DataFrame:
 
 def summarize_run(trades: pd.DataFrame, starting_balance: float) -> dict:
     """Compute a per-run summary dict from a trade-log DataFrame."""
-    taken = trades[trades["exit_reason"].isin(["profit", "stop", "time_stop"])]
+    taken = trades[trades["exit_reason"].isin(["profit", "stop", "time_stop", "hard_close"])]
     n_days = len(trades)
     n_trades = len(taken)
     if n_trades == 0:
@@ -55,6 +55,7 @@ def summarize_run(trades: pd.DataFrame, starting_balance: float) -> dict:
             "profit_exits": 0,
             "stop_exits": 0,
             "time_exits": 0,
+            "hard_close_exits": 0,
         }
 
     ending = float(taken["balance_after"].iloc[-1])
@@ -77,6 +78,7 @@ def summarize_run(trades: pd.DataFrame, starting_balance: float) -> dict:
         "profit_exits": int((taken["exit_reason"] == "profit").sum()),
         "stop_exits": int((taken["exit_reason"] == "stop").sum()),
         "time_exits": int((taken["exit_reason"] == "time_stop").sum()),
+        "hard_close_exits": int((taken["exit_reason"] == "hard_close").sum()),
     }
 
 
@@ -99,6 +101,7 @@ def summarize_sweep(sweep: pd.DataFrame, starting_balance: float) -> pd.DataFram
         "profit_exits",
         "stop_exits",
         "time_exits",
+        "hard_close_exits",
         "n_days",
     ]
     return df[cols].sort_values("total_return_pct", ascending=False)

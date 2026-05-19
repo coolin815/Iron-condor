@@ -1,53 +1,44 @@
-"""SPY 0DTE 'follow the flow' strategy.
+"""SPY 2DTE momentum-trigger strategy — entry detection.
 
-Scans 0DTE option trade tape for large BUY-aggressor prints. The first
-qualifying print of the day triggers a copy trade: buy the same contract,
-manage with PT / SL / time stop.
-
-Notes / honest caveats:
-- Aggressor classification is a proxy. We compare each trade's price to
-  the contract's 1-min bar OPEN for that minute:
-    trade_price >= bar_open  -> classify as BUY aggressor
-    trade_price <  bar_open  -> classify as SELL aggressor (we skip those)
-  A more accurate classification needs NBBO quote data, which is much
-  heavier to fetch.
-- Multi-leg filtering uses Polygon's OPRA condition codes. Prints flagged
-  as part of a multi-leg / spread / stock-tied order are skipped when
-  params.exclude_multi_leg is True. The condition-code set lives in
-  config.MULTI_LEG_CONDITION_CODES.
-- No Fridays.
+Each trading day we look for one entry signal:
+  - Starting at params.entry_start (default 10:34 ET / 7:34 PT)
+  - For each subsequent 1-min candle (up to params.max_attempts):
+      - Read the previous minute's SPY close
+      - If close >= 9:30 open + threshold  -> bias CALL
+      - If close <= 9:30 open - threshold  -> bias PUT
+      - Otherwise: not a trigger, but still counts as an attempt
+      - Compute RSI(14) at the previous minute; must be in [rsi_min, rsi_max]
+  - First minute that passes the trigger AND the RSI gate fires the signal.
+  - Entry is at the OPEN of that candle.
+  - Strike: 1-step ITM (CALL = first strike strictly < spot; PUT = first strike strictly > spot)
+  - Expiry: today + params.dte business days (skipping weekends; no holiday handling).
 """
 from __future__ import annotations
 
-import ast
 import logging
+import math
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time
 from typing import Literal
 
 import pandas as pd
 
-from .config import MULTI_LEG_CONDITION_CODES, StrategyParams
+from .config import StrategyParams
 from .polygon_client import PolygonClient, build_option_ticker
 
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Result types
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True)
 class Signal:
-    timestamp: pd.Timestamp           # the minute we'd enter (next bar after the print)
-    print_timestamp: pd.Timestamp     # when the institutional print hit the tape
-    contract: str                     # option ticker we're copying
+    timestamp: pd.Timestamp           # entry minute (we buy at this candle's open)
+    contract: str                     # Polygon option ticker
     strike: float
     right: Literal["C", "P"]
-    size: int                         # how big the print was
-    trade_price: float                # price the print hit
-    bar_open: float                   # for the aggressor classification
+    expiry: date
+    spot_at_signal: float             # SPY close from previous minute
+    rsi_at_signal: float
+    market_open: float                # SPY 9:30 open used as the anchor
 
 
 # ---------------------------------------------------------------------------
@@ -63,70 +54,36 @@ def _to_et(bars: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _is_friday(day: date) -> bool:
-    return day.weekday() == 4
+def _wilder_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder RSI on a close-price series."""
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    # Wilder smoothing — EMA with alpha = 1/period
+    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
-def _strikes_near_spot(
-    spot: float,
-    contracts: list[dict],
-    window: float = 5.0,
-) -> list[dict]:
-    """Filter the option chain to contracts whose strikes are within ±`window`
-    dollars of `spot`. Returns the original contract dicts (with strike_price,
-    contract_type, ...)."""
-    out = []
-    for c in contracts:
-        try:
-            k = float(c["strike_price"])
-        except (TypeError, ValueError, KeyError):
-            continue
-        if abs(k - spot) <= window:
-            out.append(c)
-    return out
+def _two_dte_expiry(today: date, dte: int = 2) -> date:
+    """Return the date `dte` business days after `today` (weekends skipped)."""
+    return (pd.Timestamp(today) + pd.tseries.offsets.BusinessDay(dte)).date()
 
 
-def _classify_aggressor(
-    trade_price: float, bar_open: float | None
-) -> Literal["buy", "sell", "unknown"]:
-    if bar_open is None or pd.isna(bar_open):
-        return "unknown"
-    if trade_price >= bar_open:
-        return "buy"
-    return "sell"
-
-
-def _parse_conditions(raw: object) -> set[int]:
-    """Parse Polygon's trade-conditions field into a set of int codes.
-
-    Polygon returns conditions as a list[int]. After parquet caching we
-    stored it as a string repr like "[1, 152]" — handle both.
-    """
-    if raw is None:
-        return set()
-    if isinstance(raw, (list, tuple)):
-        try:
-            return {int(c) for c in raw}
-        except (TypeError, ValueError):
-            return set()
-    if isinstance(raw, str):
-        s = raw.strip()
-        if not s or s in ("nan", "[]", "None"):
-            return set()
-        try:
-            parsed = ast.literal_eval(s)
-        except (ValueError, SyntaxError):
-            return set()
-        if isinstance(parsed, (list, tuple)):
-            try:
-                return {int(c) for c in parsed}
-            except (TypeError, ValueError):
-                return set()
-    return set()
-
-
-def _is_multi_leg(conditions_raw: object) -> bool:
-    return bool(_parse_conditions(conditions_raw) & MULTI_LEG_CONDITION_CODES)
+def _one_step_itm_strike(spot: float, right: str, step: float = 1.0) -> float:
+    """First strike strictly ITM relative to spot.
+    Call: strike < spot. Put: strike > spot. Strikes are multiples of `step`."""
+    if right == "C":
+        below = math.floor(spot / step) * step
+        if below < spot:
+            return float(below)
+        return float(below - step)
+    else:  # "P"
+        above = math.ceil(spot / step) * step
+        if above > spot:
+            return float(above)
+        return float(above + step)
 
 
 # ---------------------------------------------------------------------------
@@ -141,281 +98,125 @@ def find_signal(
     params: StrategyParams,
     underlying: str = "SPY",
 ) -> Signal | None:
-    """Dispatch to the single_print or clustered scanner per params.signal_mode."""
-    if params.signal_mode == "clustered":
-        return _find_clustered_signal(
-            today_1min_spy, contracts, client, params, underlying
-        )
-    return _find_single_print_signal(
-        today_1min_spy, contracts, client, params, underlying
-    )
+    """Scan today's SPY 1-min bars for a momentum-trigger entry.
 
-
-def _find_single_print_signal(
-    today_1min_spy: pd.DataFrame,
-    contracts: list[dict],
-    client: PolygonClient,
-    params: StrategyParams,
-    underlying: str = "SPY",
-) -> Signal | None:
-    """Scan ATM-area 0DTE trade tape for the first large BUY-aggressor print
-    inside the entry window."""
+    `contracts` is the list of option contracts expiring on the 2DTE
+    expiration. We use it to confirm the chosen strike actually trades.
+    """
     if today_1min_spy.empty:
         return None
-    if params.skip_fridays:
-        day = today_1min_spy.index[0].tz_convert("America/New_York").date()
-        if _is_friday(day):
-            return None
-    day = today_1min_spy.index[0].tz_convert("America/New_York").date()
-
-    # Use SPY's opening 9:30 bar as the anchor for picking nearby strikes.
     et = _to_et(today_1min_spy)
+    day = et.index[0].date()
+
+    # 9:30 ET open
     open_bar = et[et.index.time == time(9, 30)]
     if open_bar.empty:
         return None
-    spot_at_open = float(open_bar.iloc[0]["close"])
+    market_open = float(open_bar.iloc[0]["open"])
 
-    nearby = _strikes_near_spot(spot_at_open, contracts, window=params.strike_window)
-    if not nearby:
-        return None
+    # Same-day RSI on close
+    rsi = _wilder_rsi(et["close"], period=params.rsi_period)
 
-    # Fetch trade tape + 1-min bars for every nearby contract on this day.
-    # Then for each contract, find the first large buy-aggressor print
-    # whose ET timestamp is inside the entry window.
-    earliest = params.earliest_entry
-    latest = params.latest_entry
-    threshold = params.size_threshold
+    expiry = _two_dte_expiry(day, params.dte)
 
-    best: tuple[pd.Timestamp, Signal] | None = None  # (timestamp, signal)
-    n_large = 0
-    n_multi_leg = 0
-    for c in nearby:
+    # Build a set of strikes available for the chosen expiry so we can verify
+    # the 1-step ITM strike actually exists. Most ATM strikes do, but better
+    # safe than sorry — we'll fall back to the next strike if missing.
+    available_strikes: dict[str, set[float]] = {"C": set(), "P": set()}
+    for c in contracts:
         try:
             strike = float(c["strike_price"])
         except (TypeError, ValueError, KeyError):
             continue
         ctype = c.get("contract_type", "").lower()
-        if ctype not in ("call", "put"):
-            continue
-        right = "C" if ctype == "call" else "P"
-        ticker = build_option_ticker(underlying, day, right, strike)
+        if ctype == "call":
+            available_strikes["C"].add(strike)
+        elif ctype == "put":
+            available_strikes["P"].add(strike)
 
-        trades = client.get_option_trades(ticker, day)
-        if trades.empty:
+    minute_index = pd.Timestamp(
+        datetime.combine(day, params.entry_start)
+    ).tz_localize("America/New_York")
+
+    for attempt in range(params.max_attempts):
+        current = minute_index + pd.Timedelta(minutes=attempt)
+        prev = current - pd.Timedelta(minutes=1)
+
+        # Previous candle's close
+        try:
+            prev_close = float(et.loc[prev, "close"])
+        except KeyError:
+            log.debug("%s attempt %d: prev bar %s missing", day, attempt + 1, prev.time())
             continue
-        big = trades[trades["size"] >= threshold]
-        if big.empty:
+        if pd.isna(prev_close):
             continue
 
-        bars = client.get_option_minute_bars(ticker, day)
-        if bars.empty:
-            continue
-        bars = _to_et(bars)
-
-        for _, row in big.iterrows():
-            n_large += 1
-            if params.exclude_multi_leg and _is_multi_leg(row.get("conditions")):
-                n_multi_leg += 1
-                continue
-            ts_ns = int(row["sip_timestamp_ns"])
-            ts = pd.Timestamp(ts_ns, unit="ns", tz="UTC").tz_convert("America/New_York")
-            tt = ts.time()
-            if tt < earliest or tt > latest:
-                continue
-            minute = ts.floor("min")
-            try:
-                bar = bars.loc[minute]
-            except KeyError:
-                continue
-            bar_open = float(bar["open"]) if not pd.isna(bar["open"]) else None
-            trade_price = float(row["price"])
-            if _classify_aggressor(trade_price, bar_open) != "buy":
-                continue
-            # Entry happens at the NEXT 1-min bar's open (we react after the
-            # print fully fires). signal.timestamp is the entry minute.
-            entry_minute = (minute + pd.Timedelta(minutes=1))
-            sig = Signal(
-                timestamp=entry_minute,
-                print_timestamp=ts,
-                contract=ticker,
-                strike=strike,
-                right=right,
-                size=int(row["size"]),
-                trade_price=trade_price,
-                bar_open=bar_open if bar_open is not None else float("nan"),
+        diff = prev_close - market_open
+        if diff >= params.price_move_threshold:
+            right = "C"
+        elif diff <= -params.price_move_threshold:
+            right = "P"
+        else:
+            log.debug(
+                "%s attempt %d (%s): diff=%+.3f below threshold $%.2f",
+                day, attempt + 1, current.time(), diff, params.price_move_threshold,
             )
-            if best is None or ts < best[0]:
-                best = (ts, sig)
-            break  # first qualifying print per contract is enough
+            continue
 
-    if n_large:
-        log.debug(
-            "%s: %d large prints, %d filtered as multi-leg",
-            day, n_large, n_multi_leg,
-        )
-    if best is None:
-        return None
-    return best[1]
-
-
-def _find_clustered_signal(
-    today_1min_spy: pd.DataFrame,
-    contracts: list[dict],
-    client: PolygonClient,
-    params: StrategyParams,
-    underlying: str = "SPY",
-) -> Signal | None:
-    """Scan ATM-area 0DTE trade tape for the first 1-min candle in which
-    >= params.cluster_min_trades buy-aggressor prints of size >=
-    params.size_threshold land on contracts in the SAME direction
-    (all calls OR all puts) anywhere inside the ATM strike window.
-    Clusters can span adjacent strikes — catches sweeps that route
-    across multiple strikes on the same side."""
-    if today_1min_spy.empty:
-        return None
-    if params.skip_fridays:
-        day = today_1min_spy.index[0].tz_convert("America/New_York").date()
-        if _is_friday(day):
-            return None
-    day = today_1min_spy.index[0].tz_convert("America/New_York").date()
-
-    et = _to_et(today_1min_spy)
-    open_bar = et[et.index.time == time(9, 30)]
-    if open_bar.empty:
-        return None
-    spot_at_open = float(open_bar.iloc[0]["close"])
-
-    nearby = _strikes_near_spot(spot_at_open, contracts, window=params.strike_window)
-    if not nearby:
-        return None
-
-    earliest = params.earliest_entry
-    latest = params.latest_entry
-    threshold = params.size_threshold
-    min_count = max(1, int(params.cluster_min_trades))
-
-    # Aggregate qualifying buy-aggressor prints across all contracts in the
-    # window, keyed by (right, minute) so calls and puts cluster separately.
-    by_dir_minute: dict[tuple[str, pd.Timestamp], list[dict]] = {}
-    n_large_total = 0
-    n_multi_leg_total = 0
-    n_sell_total = 0
-    n_buy_kept_total = 0
-    n_outside_window_total = 0
-    n_no_bar_total = 0
-    n_unknown_aggressor_total = 0
-
-    for c in nearby:
+        # RSI gate (evaluated at the previous candle's timestamp)
         try:
-            strike = float(c["strike_price"])
-        except (TypeError, ValueError, KeyError):
+            rsi_val = float(rsi.loc[prev])
+        except KeyError:
             continue
-        ctype = c.get("contract_type", "").lower()
-        if ctype not in ("call", "put"):
+        if pd.isna(rsi_val):
             continue
-        right = "C" if ctype == "call" else "P"
-        ticker = build_option_ticker(underlying, day, right, strike)
-
-        trades = client.get_option_trades(ticker, day)
-        if trades.empty:
-            continue
-        big = trades[trades["size"] >= threshold]
-        if big.empty:
+        if rsi_val < params.rsi_min or rsi_val > params.rsi_max:
+            log.debug(
+                "%s attempt %d (%s): RSI=%.1f outside [%.0f, %.0f]",
+                day, attempt + 1, current.time(),
+                rsi_val, params.rsi_min, params.rsi_max,
+            )
             continue
 
-        bars = client.get_option_minute_bars(ticker, day)
-        if bars.empty:
+        # Both gates passed. Need entry bar to exist (we'll fill at its open).
+        try:
+            entry_bar = et.loc[current]
+        except KeyError:
+            log.debug("%s attempt %d: entry bar %s missing", day, attempt + 1, current.time())
             continue
-        bars = _to_et(bars)
+        if pd.isna(entry_bar.get("open")):
+            continue
 
-        for _, row in big.iterrows():
-            n_large_total += 1
-            if params.exclude_multi_leg and _is_multi_leg(row.get("conditions")):
-                n_multi_leg_total += 1
+        # 1-step ITM strike, with fallback if the exact one isn't listed.
+        strike = _one_step_itm_strike(prev_close, right, step=params.strike_step)
+        if available_strikes.get(right):
+            tries = 0
+            while strike not in available_strikes[right] and tries < 4:
+                # Push one further ITM
+                strike = strike - params.strike_step if right == "C" else strike + params.strike_step
+                tries += 1
+            if strike not in available_strikes[right]:
+                log.debug("%s attempt %d: no ITM strike near %.2f for %s",
+                          day, attempt + 1, prev_close, right)
                 continue
-            ts_ns = int(row["sip_timestamp_ns"])
-            ts = pd.Timestamp(ts_ns, unit="ns", tz="UTC").tz_convert("America/New_York")
-            tt = ts.time()
-            if tt < earliest or tt > latest:
-                n_outside_window_total += 1
-                continue
-            minute = ts.floor("min")
-            try:
-                bar = bars.loc[minute]
-            except KeyError:
-                n_no_bar_total += 1
-                continue
-            bar_open = float(bar["open"]) if not pd.isna(bar["open"]) else None
-            trade_price = float(row["price"])
-            aggressor = _classify_aggressor(trade_price, bar_open)
-            if aggressor == "buy":
-                n_buy_kept_total += 1
-                by_dir_minute.setdefault((right, minute), []).append({
-                    "ts": ts,
-                    "price": trade_price,
-                    "size": int(row["size"]),
-                    "bar_open": bar_open,
-                    "strike": strike,
-                    "right": right,
-                })
-            elif aggressor == "sell":
-                n_sell_total += 1
-            else:
-                n_unknown_aggressor_total += 1
 
-    max_per_minute = max((len(rs) for rs in by_dir_minute.values()), default=0)
+        ticker = build_option_ticker(underlying, expiry, right, strike)
+        log.debug(
+            "%s attempt %d ENTRY at %s: prev_close=%.3f open=%.3f diff=%+.3f "
+            "right=%s strike=%.0f rsi=%.1f -> %s",
+            day, attempt + 1, current.time(), prev_close, market_open, diff,
+            right, strike, rsi_val, ticker,
+        )
+        return Signal(
+            timestamp=current,
+            contract=ticker,
+            strike=strike,
+            right=right,
+            expiry=expiry,
+            spot_at_signal=prev_close,
+            rsi_at_signal=rsi_val,
+            market_open=market_open,
+        )
 
-    qualifying: list[tuple[pd.Timestamp, str, list[dict]]] = [
-        (minute, right, rs)
-        for (right, minute), rs in by_dir_minute.items()
-        if len(rs) >= min_count
-    ]
-    n_clusters_found = len(qualifying)
-
-    log.debug(
-        "%s [clustered S>=%d N>=%d, cross-strike same-dir, win=±$%.0f]: "
-        "large=%d multi_leg=%d outside_window=%d no_bar=%d unknown_agg=%d "
-        "sell=%d buy_kept=%d max_per_minute=%d clusters_found=%d",
-        day, threshold, min_count, params.strike_window,
-        n_large_total, n_multi_leg_total, n_outside_window_total,
-        n_no_bar_total, n_unknown_aggressor_total,
-        n_sell_total, n_buy_kept_total,
-        max_per_minute, n_clusters_found,
-    )
-
-    if not qualifying:
-        return None
-
-    # Earliest qualifying minute wins.
-    qualifying.sort(key=lambda q: q[0])
-    minute, right, prints = qualifying[0]
-
-    # Pick the dominant strike (most prints in the cluster, tiebreak by
-    # closest to ATM) as the contract we'll actually trade.
-    by_strike: dict[float, list[dict]] = {}
-    for p in prints:
-        by_strike.setdefault(p["strike"], []).append(p)
-    best_strike = max(
-        by_strike.keys(),
-        key=lambda s: (len(by_strike[s]), -abs(s - spot_at_open)),
-    )
-    strike_prints = by_strike[best_strike]
-    trigger = max(strike_prints, key=lambda p: p["ts"])
-
-    total_size = sum(p["size"] for p in prints)
-    entry_minute = minute + pd.Timedelta(minutes=1)
-    ticker = build_option_ticker(underlying, day, right, best_strike)
-    return Signal(
-        timestamp=entry_minute,
-        print_timestamp=trigger["ts"],
-        contract=ticker,
-        strike=best_strike,
-        right=right,
-        size=total_size,
-        trade_price=trigger["price"],
-        bar_open=(
-            trigger["bar_open"]
-            if trigger["bar_open"] is not None
-            else float("nan")
-        ),
-    )
+    log.debug("%s: no signal after %d attempts", day, params.max_attempts)
+    return None
