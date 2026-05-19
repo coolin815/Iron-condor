@@ -224,13 +224,16 @@ class PolygonClient:
     ) -> list[dict[str, Any]]:
         """Return every option contract for `underlying` expiring on the given date.
 
-        Includes expired contracts (which is what we want for historical days).
+        Polygon's `expired` param actually filters to *only* expired contracts
+        when true, so for future expiries we have to retry without it. We cache
+        only non-empty results so a transient miss doesn't poison the cache.
         """
         ns = f"contracts_{underlying}"
         cache = self._cache_path(ns, expiration_date.isoformat(), "json")
         if cache.exists() and not force:
             return json.loads(cache.read_text())
 
+        # First try: include historical/expired contracts. Works for past expiries.
         results = self._paginate(
             "/v3/reference/options/contracts",
             {
@@ -240,7 +243,18 @@ class PolygonClient:
                 "limit": 1000,
             },
         )
-        cache.write_text(json.dumps(results))
+        if not results:
+            # Future expiry — contracts are still active. Retry without filter.
+            results = self._paginate(
+                "/v3/reference/options/contracts",
+                {
+                    "underlying_ticker": underlying,
+                    "expiration_date": expiration_date.isoformat(),
+                    "limit": 1000,
+                },
+            )
+        if results:
+            cache.write_text(json.dumps(results))
         return results
 
     # ------------------------------------------------------------------
