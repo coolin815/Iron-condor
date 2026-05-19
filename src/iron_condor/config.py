@@ -43,7 +43,7 @@ class StrategyParams:
     size_threshold: int = 1500
 
     # Strike scope: only look at contracts within ±this many dollars of spot
-    strike_window: float = 5.0
+    strike_window: float = 10.0
 
     # Skip prints whose conditions indicate they're part of a multi-leg /
     # spread / stock-tied order (not a directional single-leg buy).
@@ -90,6 +90,6 @@ STOP_LOSSES: tuple[float, ...] = (0.10, 0.15, 0.20, 0.25, 0.30)
 ENTRY_MODES: tuple[str, ...] = ("instant", "next_bar_open")
 
 # Sweep grids — clustered mode (--signal-mode clustered)
-CLUSTER_SIZE_THRESHOLDS: tuple[int, ...] = (2500, 3000, 3500, 4000, 4500, 5000)
+CLUSTER_SIZE_THRESHOLDS: tuple[int, ...] = (500, 1000, 1500, 2000, 2500)
 CLUSTER_PROFIT_TARGETS: tuple[float, ...] = (0.05, 0.10, 0.15)
 CLUSTER_STOP_LOSSES: tuple[float, ...] = (0.20, 0.25, 0.30, 0.40, 0.50)

@@ -55,7 +55,7 @@ def test_strikes_near_spot_skips_missing_strike() -> None:
 def test_default_params_size_threshold() -> None:
     p = StrategyParams()
     assert p.size_threshold == 1500
-    assert p.strike_window == 5.0
+    assert p.strike_window == 10.0
     assert p.skip_fridays is True
     assert p.exclude_multi_leg is True
 

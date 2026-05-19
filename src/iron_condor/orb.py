@@ -175,7 +175,7 @@ def _find_single_print_signal(
         return None
     spot_at_open = float(open_bar.iloc[0]["close"])
 
-    nearby = _strikes_near_spot(spot_at_open, contracts, window=5.0)
+    nearby = _strikes_near_spot(spot_at_open, contracts, window=params.strike_window)
     if not nearby:
         return None
 
@@ -285,7 +285,7 @@ def _find_clustered_signal(
         return None
     spot_at_open = float(open_bar.iloc[0]["close"])
 
-    nearby = _strikes_near_spot(spot_at_open, contracts, window=5.0)
+    nearby = _strikes_near_spot(spot_at_open, contracts, window=params.strike_window)
     if not nearby:
         return None
 
@@ -301,6 +301,9 @@ def _find_clustered_signal(
     n_multi_leg_total = 0
     n_sell_total = 0
     n_buy_kept_total = 0
+    n_outside_window_total = 0
+    n_no_bar_total = 0
+    n_unknown_aggressor_total = 0
 
     for c in nearby:
         try:
@@ -334,28 +337,31 @@ def _find_clustered_signal(
             ts = pd.Timestamp(ts_ns, unit="ns", tz="UTC").tz_convert("America/New_York")
             tt = ts.time()
             if tt < earliest or tt > latest:
+                n_outside_window_total += 1
                 continue
             minute = ts.floor("min")
             try:
                 bar = bars.loc[minute]
             except KeyError:
+                n_no_bar_total += 1
                 continue
             bar_open = float(bar["open"]) if not pd.isna(bar["open"]) else None
             trade_price = float(row["price"])
             aggressor = _classify_aggressor(trade_price, bar_open)
-            if aggressor != "buy":
-                if aggressor == "sell":
-                    n_sell_total += 1
-                continue
-            n_buy_kept_total += 1
-            by_dir_minute.setdefault((right, minute), []).append({
-                "ts": ts,
-                "price": trade_price,
-                "size": int(row["size"]),
-                "bar_open": bar_open,
-                "strike": strike,
-                "right": right,
-            })
+            if aggressor == "buy":
+                n_buy_kept_total += 1
+                by_dir_minute.setdefault((right, minute), []).append({
+                    "ts": ts,
+                    "price": trade_price,
+                    "size": int(row["size"]),
+                    "bar_open": bar_open,
+                    "strike": strike,
+                    "right": right,
+                })
+            elif aggressor == "sell":
+                n_sell_total += 1
+            else:
+                n_unknown_aggressor_total += 1
 
     max_per_minute = max((len(rs) for rs in by_dir_minute.values()), default=0)
 
@@ -367,10 +373,13 @@ def _find_clustered_signal(
     n_clusters_found = len(qualifying)
 
     log.debug(
-        "%s [clustered S>=%d N>=%d, cross-strike same-dir]: large=%d "
-        "multi_leg=%d sell=%d buy_kept=%d max_per_minute=%d clusters_found=%d",
-        day, threshold, min_count,
-        n_large_total, n_multi_leg_total, n_sell_total, n_buy_kept_total,
+        "%s [clustered S>=%d N>=%d, cross-strike same-dir, win=±$%.0f]: "
+        "large=%d multi_leg=%d outside_window=%d no_bar=%d unknown_agg=%d "
+        "sell=%d buy_kept=%d max_per_minute=%d clusters_found=%d",
+        day, threshold, min_count, params.strike_window,
+        n_large_total, n_multi_leg_total, n_outside_window_total,
+        n_no_bar_total, n_unknown_aggressor_total,
+        n_sell_total, n_buy_kept_total,
         max_per_minute, n_clusters_found,
     )
 
