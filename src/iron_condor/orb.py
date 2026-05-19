@@ -1,17 +1,18 @@
-"""SPY 2DTE momentum-trigger strategy — entry detection.
+"""SPY consecutive-20min-candle entry trigger.
 
-Each trading day we look for one entry signal:
-  - Starting at params.entry_start (default 10:34 ET / 7:34 PT)
-  - For each subsequent 1-min candle (up to params.max_attempts):
-      - Read the previous minute's SPY close
-      - If close >= 9:30 open + threshold  -> bias CALL
-      - If close <= 9:30 open - threshold  -> bias PUT
-      - Otherwise: not a trigger, but still counts as an attempt
-      - Compute RSI(14) at the previous minute; must be in [rsi_min, rsi_max]
-  - First minute that passes the trigger AND the RSI gate fires the signal.
-  - Entry is at the OPEN of that candle.
-  - Strike: 1-step ITM (CALL = first strike strictly < spot; PUT = first strike strictly > spot)
-  - Expiry: today + params.dte business days (skipping weekends; no holiday handling).
+Each trading day:
+  - Resample SPY 1-min bars into 20-min OHLC candles starting at 9:30 ET.
+  - Walk candles in order; track each candle's direction (green / red / doji).
+  - On the FIRST occurrence of two consecutive same-direction candles, fire:
+      - 2 greens -> ATM call
+      - 2 reds   -> ATM put
+  - Entry fills at the OPEN of the next 1-min bar after the 2nd 20-min candle
+    closes (e.g. 2nd candle [10:10, 10:30) -> entry minute = 10:30).
+  - If the entry minute is past params.latest_entry, skip the day.
+
+Position:
+  - ATM (nearest $1 strike, round half up).
+  - DTE: today (0DTE) or today + 2 business days (2DTE), per params.dte.
 """
 from __future__ import annotations
 
@@ -31,14 +32,15 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class Signal:
-    timestamp: pd.Timestamp           # entry minute (we buy at this candle's open)
-    contract: str                     # Polygon option ticker
+    timestamp: pd.Timestamp           # entry minute (1-min bar open = fill)
+    contract: str
     strike: float
     right: Literal["C", "P"]
     expiry: date
-    spot_at_signal: float             # SPY close from previous minute
-    rsi_at_signal: float
-    market_open: float                # SPY 9:30 open used as the anchor
+    spot_at_entry: float
+    trigger_open: float               # 2nd candle open
+    trigger_close: float              # 2nd candle close
+    direction: Literal["green", "red"]
 
 
 # ---------------------------------------------------------------------------
@@ -54,36 +56,38 @@ def _to_et(bars: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _wilder_rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    """Wilder RSI on a close-price series."""
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    # Wilder smoothing — EMA with alpha = 1/period
-    avg_gain = gain.ewm(alpha=1.0 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+def _aggregate_candles(bars: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    """Resample ET-indexed 1-min bars into N-min OHLC. Anchors on the first bar
+    (which is 9:30 ET in practice). Label is the LEFT edge of each bucket so
+    bucket label + minutes == bucket close time."""
+    if bars.empty:
+        return bars
+    origin = bars.index[0]
+    agg = bars.resample(
+        f"{minutes}min", origin=origin, label="left", closed="left",
+    ).agg({"open": "first", "high": "max", "low": "min",
+           "close": "last", "volume": "sum"})
+    return agg.dropna(subset=["open", "close"])
 
 
-def _two_dte_expiry(today: date, dte: int = 2) -> date:
-    """Return the date `dte` business days after `today` (weekends skipped)."""
+def _nearest_atm_strike(spot: float, step: float = 1.0) -> float:
+    """Nearest strike multiple of step. Round half up."""
+    return math.floor(spot / step + 0.5) * step
+
+
+def _expiry_for_dte(today: date, dte: int) -> date:
+    """0 DTE = today; >0 DTE = today + dte business days (weekends skipped)."""
+    if dte <= 0:
+        return today
     return (pd.Timestamp(today) + pd.tseries.offsets.BusinessDay(dte)).date()
 
 
-def _one_step_itm_strike(spot: float, right: str, step: float = 1.0) -> float:
-    """First strike strictly ITM relative to spot.
-    Call: strike < spot. Put: strike > spot. Strikes are multiples of `step`."""
-    if right == "C":
-        below = math.floor(spot / step) * step
-        if below < spot:
-            return float(below)
-        return float(below - step)
-    else:  # "P"
-        above = math.ceil(spot / step) * step
-        if above > spot:
-            return float(above)
-        return float(above + step)
+def _candle_direction(open_: float, close: float) -> str | None:
+    if close > open_:
+        return "green"
+    if close < open_:
+        return "red"
+    return None  # doji — breaks the streak
 
 
 # ---------------------------------------------------------------------------
@@ -98,30 +102,23 @@ def find_signal(
     params: StrategyParams,
     underlying: str = "SPY",
 ) -> Signal | None:
-    """Scan today's SPY 1-min bars for a momentum-trigger entry.
-
-    `contracts` is the list of option contracts expiring on the 2DTE
-    expiration. We use it to confirm the chosen strike actually trades.
-    """
+    """Scan today's SPY tape for the first 2-consecutive-direction 20-min candle pattern."""
     if today_1min_spy.empty:
         return None
     et = _to_et(today_1min_spy)
     day = et.index[0].date()
 
-    # 9:30 ET open
-    open_bar = et[et.index.time == time(9, 30)]
-    if open_bar.empty:
+    candles = _aggregate_candles(et, params.candle_minutes)
+    if len(candles) < 2:
         return None
-    market_open = float(open_bar.iloc[0]["open"])
 
-    # Same-day RSI on close
-    rsi = _wilder_rsi(et["close"], period=params.rsi_period)
+    latest_entry_ts = pd.Timestamp(
+        datetime.combine(day, params.latest_entry)
+    ).tz_localize("America/New_York")
+    expiry = _expiry_for_dte(day, params.dte)
 
-    expiry = _two_dte_expiry(day, params.dte)
-
-    # Build a set of strikes available for the chosen expiry so we can verify
-    # the 1-step ITM strike actually exists. Most ATM strikes do, but better
-    # safe than sorry — we'll fall back to the next strike if missing.
+    # Set of strikes available for the chosen expiry — fall back to nearest
+    # available if the literal round-half-up strike isn't listed.
     available_strikes: dict[str, set[float]] = {"C": set(), "P": set()}
     for c in contracts:
         try:
@@ -134,89 +131,70 @@ def find_signal(
         elif ctype == "put":
             available_strikes["P"].add(strike)
 
-    minute_index = pd.Timestamp(
-        datetime.combine(day, params.entry_start)
-    ).tz_localize("America/New_York")
+    prev_dir: str | None = None
+    for label_ts in candles.index:
+        bar = candles.loc[label_ts]
+        open_ = float(bar["open"])
+        close_ = float(bar["close"])
+        this_dir = _candle_direction(open_, close_)
 
-    for attempt in range(params.max_attempts):
-        current = minute_index + pd.Timedelta(minutes=attempt)
-        prev = current - pd.Timedelta(minutes=1)
+        if this_dir is not None and this_dir == prev_dir:
+            # Two in a row. Entry minute = 2nd candle's close-time.
+            entry_ts = label_ts + pd.Timedelta(minutes=params.candle_minutes)
+            if entry_ts > latest_entry_ts:
+                log.debug(
+                    "%s: 2nd %s candle at %s closes too late (latest %s)",
+                    day, this_dir, label_ts.time(), params.latest_entry,
+                )
+                return None
+            try:
+                entry_bar = et.loc[entry_ts]
+            except KeyError:
+                log.debug("%s: entry 1-min bar at %s missing", day, entry_ts.time())
+                # Need a bar to fill on — bail rather than skip ahead
+                return None
+            entry_open = entry_bar.get("open")
+            if entry_open is None or pd.isna(entry_open):
+                return None
+            spot = float(entry_open)
+            right = "C" if this_dir == "green" else "P"
+            strike = _nearest_atm_strike(spot, step=params.strike_step)
 
-        # Previous candle's close
-        try:
-            prev_close = float(et.loc[prev, "close"])
-        except KeyError:
-            log.debug("%s attempt %d: prev bar %s missing", day, attempt + 1, prev.time())
-            continue
-        if pd.isna(prev_close):
-            continue
+            # Verify strike trades; if not, walk outward
+            if available_strikes.get(right):
+                tries = 0
+                while strike not in available_strikes[right] and tries < 4:
+                    # Alternate +/- 1 strike step outward
+                    delta = params.strike_step * (1 if tries % 2 == 0 else -1) * ((tries // 2) + 1)
+                    strike = _nearest_atm_strike(spot, step=params.strike_step) + delta
+                    tries += 1
+                if strike not in available_strikes[right]:
+                    log.debug("%s: no ATM strike near %.2f for %s on %s",
+                              day, spot, right, expiry)
+                    return None
 
-        diff = prev_close - market_open
-        if diff >= params.price_move_threshold:
-            right = "C"
-        elif diff <= -params.price_move_threshold:
-            right = "P"
-        else:
+            ticker = build_option_ticker(underlying, expiry, right, strike)
             log.debug(
-                "%s attempt %d (%s): diff=%+.3f below threshold $%.2f",
-                day, attempt + 1, current.time(), diff, params.price_move_threshold,
+                "%s ENTRY @ %s: 2x%s 20-min candles "
+                "(prev close %.3f -> open %.3f -> close %.3f, "
+                "spot %.3f, strike %.0f%s, dte=%d) -> %s",
+                day, entry_ts.time(), this_dir,
+                float(candles.iloc[candles.index.get_loc(label_ts) - 1]["close"])
+                if candles.index.get_loc(label_ts) > 0 else float("nan"),
+                open_, close_, spot, strike, right, params.dte, ticker,
             )
-            continue
-
-        # RSI gate (evaluated at the previous candle's timestamp)
-        try:
-            rsi_val = float(rsi.loc[prev])
-        except KeyError:
-            continue
-        if pd.isna(rsi_val):
-            continue
-        if rsi_val < params.rsi_min or rsi_val > params.rsi_max:
-            log.debug(
-                "%s attempt %d (%s): RSI=%.1f outside [%.0f, %.0f]",
-                day, attempt + 1, current.time(),
-                rsi_val, params.rsi_min, params.rsi_max,
+            return Signal(
+                timestamp=entry_ts,
+                contract=ticker,
+                strike=strike,
+                right=right,
+                expiry=expiry,
+                spot_at_entry=spot,
+                trigger_open=open_,
+                trigger_close=close_,
+                direction=this_dir,  # type: ignore[arg-type]
             )
-            continue
 
-        # Both gates passed. Need entry bar to exist (we'll fill at its open).
-        try:
-            entry_bar = et.loc[current]
-        except KeyError:
-            log.debug("%s attempt %d: entry bar %s missing", day, attempt + 1, current.time())
-            continue
-        if pd.isna(entry_bar.get("open")):
-            continue
+        prev_dir = this_dir
 
-        # 1-step ITM strike, with fallback if the exact one isn't listed.
-        strike = _one_step_itm_strike(prev_close, right, step=params.strike_step)
-        if available_strikes.get(right):
-            tries = 0
-            while strike not in available_strikes[right] and tries < 4:
-                # Push one further ITM
-                strike = strike - params.strike_step if right == "C" else strike + params.strike_step
-                tries += 1
-            if strike not in available_strikes[right]:
-                log.debug("%s attempt %d: no ITM strike near %.2f for %s",
-                          day, attempt + 1, prev_close, right)
-                continue
-
-        ticker = build_option_ticker(underlying, expiry, right, strike)
-        log.debug(
-            "%s attempt %d ENTRY at %s: prev_close=%.3f open=%.3f diff=%+.3f "
-            "right=%s strike=%.0f rsi=%.1f -> %s",
-            day, attempt + 1, current.time(), prev_close, market_open, diff,
-            right, strike, rsi_val, ticker,
-        )
-        return Signal(
-            timestamp=current,
-            contract=ticker,
-            strike=strike,
-            right=right,
-            expiry=expiry,
-            spot_at_signal=prev_close,
-            rsi_at_signal=rsi_val,
-            market_open=market_open,
-        )
-
-    log.debug("%s: no signal after %d attempts", day, params.max_attempts)
     return None

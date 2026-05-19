@@ -1,16 +1,20 @@
-"""Strategy parameters for the SPY 2DTE momentum-trigger strategy.
+"""Strategy parameters for the SPY consecutive-20min-candle trigger.
 
-Entry trigger (around 10:34 ET / 7:34 PT):
-  - SPY 1-min close vs today's 9:30 ET regular-session open
-  - If close >= open + $0.15  -> 1-step ITM 2DTE CALL
-  - If close <= open - $0.15  -> 1-step ITM 2DTE PUT
-  - RSI(14) on same-day SPY 1-min closes must be 30-70
-  - Try each subsequent minute up to `max_attempts` (default 5) if no entry yet
+Entry trigger (each trading day, anchored at 9:30 ET):
+  - Build 20-min OHLC candles: [9:30, 9:50), [9:50, 10:10), [10:10, 10:30), ...
+  - A candle is "green" if close > open, "red" if close < open. Doji breaks streak.
+  - On the first occurrence of two consecutive same-direction candles, fire signal.
+  - Entry fills at the OPEN of the NEXT 1-min candle after the 2nd 20-min candle closes.
+  - Latest possible entry time: params.latest_entry (default 12:30 ET == 9:30 PT).
+
+Position:
+  - ATM strike (nearest $1 to spot, round half up).
+  - 0 DTE or 2 DTE — swept as a dimension to compare.
 
 Exit:
-  - Profit target (PT) hit on mid-to-mid or net-after-fees (per pnl_mode)
-  - Stop loss — either a % loss (gross/net per pnl_mode) OR an N-minute time stop
-  - Hard close at 3:55 PM ET to avoid overnight gap risk
+  - Profit target on mid-to-mid (gross) or net-after-fees (per pnl_mode).
+  - Stop loss as a % of capital (matches pnl_mode).
+  - Hard close at 3:55 PM ET fallback.
 """
 from __future__ import annotations
 
@@ -24,24 +28,17 @@ UNDERLYING: str = "SPY"
 @dataclass(frozen=True)
 class StrategyParams:
     # -- Entry trigger --
-    entry_start: time = time(10, 34)       # 10:34 ET == 7:34 PT
-    max_attempts: int = 5                  # consecutive 1-min checks; give up after
-    price_move_threshold: float = 0.15     # required move vs 9:30 open ($)
-
-    # -- RSI gate --
-    rsi_period: int = 14                   # Wilder, same-day
-    rsi_min: float = 30.0
-    rsi_max: float = 70.0
+    candle_minutes: int = 20
+    latest_entry: time = time(12, 30)      # 12:30 ET == 9:30 PT
 
     # -- Contract selection --
-    dte: int = 2                           # 2 trading days to expiration
+    dte: int = 0                           # 0 (today's expiry) or 2 (today + 2 BD)
     strike_step: float = 1.0               # SPY $1 strikes at ATM
 
     # -- Exits --
     hard_close: time = time(15, 55)
-    profit_target_pct: float = 0.10        # 10% gross by default
-    stop_loss_pct: float = 0.30            # 30% (0 if using time stop)
-    stop_loss_minutes: int = 0             # >0 means time stop, ignore stop_loss_pct
+    profit_target_pct: float = 0.05
+    stop_loss_pct: float = 0.20
     pnl_mode: Literal["gross", "net"] = "gross"
 
     # -- Execution --
@@ -55,22 +52,15 @@ class StrategyParams:
 
 # Sweep grid — (profit_target_pct, pnl_mode) pairs
 PROFIT_SCENARIOS: tuple[tuple[float, str], ...] = (
-    (0.02, "gross"),
-    (0.02, "net"),
     (0.03, "gross"),
     (0.03, "net"),
+    (0.05, "gross"),
+    (0.05, "net"),
+    (0.10, "gross"),
 )
 
-# Sweep grid — (stop_loss_pct, stop_loss_minutes) pairs. Exactly one is non-zero per row.
-STOP_SCENARIOS: tuple[tuple[float, int], ...] = (
-    (0.20, 0),
-    (0.25, 0),
-    (0.30, 0),
-    (0.35, 0),
-    (0.40, 0),
-    (0.45, 0),
-    (0.50, 0),
-    (0.0, 60),
-    (0.0, 90),
-    (0.0, 120),
-)
+# Sweep grid — stop_loss_pct values; mode is paired with PT's mode
+STOP_SCENARIOS: tuple[float, ...] = (0.15, 0.20, 0.25, 0.30)
+
+# Sweep grid — DTE values to compare
+DTE_VALUES: tuple[int, ...] = (0, 2)

@@ -1,4 +1,4 @@
-"""Tests for the SPY 2DTE momentum-trigger strategy."""
+"""Tests for the SPY 20-min-candle trigger strategy."""
 from __future__ import annotations
 
 from datetime import date
@@ -6,77 +6,80 @@ from datetime import date
 import pandas as pd
 
 from iron_condor.config import (
+    DTE_VALUES,
     PROFIT_SCENARIOS,
     STOP_SCENARIOS,
     StrategyParams,
 )
-from iron_condor.orb import _one_step_itm_strike, _two_dte_expiry, _wilder_rsi
+from iron_condor.orb import (
+    _aggregate_candles,
+    _candle_direction,
+    _expiry_for_dte,
+    _nearest_atm_strike,
+)
 
 
 def test_default_params() -> None:
     p = StrategyParams()
-    assert p.price_move_threshold == 0.15
-    assert p.rsi_period == 14
-    assert p.rsi_min == 30.0
-    assert p.rsi_max == 70.0
-    assert p.max_attempts == 5
-    assert p.dte == 2
-    assert p.entry_start.hour == 10
-    assert p.entry_start.minute == 34
+    assert p.candle_minutes == 20
+    assert p.latest_entry.hour == 12
+    assert p.latest_entry.minute == 30
+    assert p.dte == 0
+    assert p.strike_step == 1.0
 
 
-def test_two_dte_skips_weekends() -> None:
-    # Monday 2026-05-11 + 2 business days = Wednesday 2026-05-13
-    assert _two_dte_expiry(date(2026, 5, 11)) == date(2026, 5, 13)
-    # Tuesday -> Thursday
-    assert _two_dte_expiry(date(2026, 5, 12)) == date(2026, 5, 14)
-    # Wednesday -> Friday
-    assert _two_dte_expiry(date(2026, 5, 13)) == date(2026, 5, 15)
-    # Thursday -> Monday (skip weekend)
-    assert _two_dte_expiry(date(2026, 5, 14)) == date(2026, 5, 18)
-    # Friday -> Tuesday (skip weekend)
-    assert _two_dte_expiry(date(2026, 5, 15)) == date(2026, 5, 19)
+def test_expiry_zero_dte_is_today() -> None:
+    assert _expiry_for_dte(date(2026, 5, 11), 0) == date(2026, 5, 11)
 
 
-def test_one_step_itm_strike_call_below_spot() -> None:
-    # Spot 590.55 -> 590 call (first strike below)
-    assert _one_step_itm_strike(590.55, "C") == 590.0
-    # Spot 590.01 -> 590 call
-    assert _one_step_itm_strike(590.01, "C") == 590.0
+def test_expiry_two_dte_skips_weekends() -> None:
+    # Monday + 2 BD -> Wednesday
+    assert _expiry_for_dte(date(2026, 5, 11), 2) == date(2026, 5, 13)
+    # Thursday + 2 BD -> Monday
+    assert _expiry_for_dte(date(2026, 5, 14), 2) == date(2026, 5, 18)
+    # Friday + 2 BD -> Tuesday
+    assert _expiry_for_dte(date(2026, 5, 15), 2) == date(2026, 5, 19)
 
 
-def test_one_step_itm_strike_call_when_spot_on_strike() -> None:
-    # Spot exactly 590.00 -> 589 (590 is ATM, not ITM)
-    assert _one_step_itm_strike(590.0, "C") == 589.0
+def test_nearest_atm_strike_rounds_half_up() -> None:
+    assert _nearest_atm_strike(590.55) == 591.0
+    assert _nearest_atm_strike(590.49) == 590.0
+    # Exactly on half rounds up
+    assert _nearest_atm_strike(590.5) == 591.0
+    assert _nearest_atm_strike(590.0) == 590.0
 
 
-def test_one_step_itm_strike_put_above_spot() -> None:
-    # Spot 590.55 -> 591 put
-    assert _one_step_itm_strike(590.55, "P") == 591.0
-    # Spot 590.99 -> 591 put
-    assert _one_step_itm_strike(590.99, "P") == 591.0
+def test_candle_direction() -> None:
+    assert _candle_direction(100.0, 100.5) == "green"
+    assert _candle_direction(100.0, 99.5) == "red"
+    assert _candle_direction(100.0, 100.0) is None  # doji
 
 
-def test_one_step_itm_strike_put_when_spot_on_strike() -> None:
-    # Spot exactly 590.00 -> 591 (590 is ATM, not ITM)
-    assert _one_step_itm_strike(590.0, "P") == 591.0
-
-
-def test_wilder_rsi_known_values() -> None:
-    # Monotonically increasing prices -> RSI should approach 100
-    close = pd.Series([float(i) for i in range(1, 30)])
-    rsi = _wilder_rsi(close, period=14)
-    assert rsi.iloc[-1] > 90.0
-    # Monotonically decreasing prices -> RSI should approach 0
-    close_down = pd.Series([float(30 - i) for i in range(30)])
-    rsi_down = _wilder_rsi(close_down, period=14)
-    assert rsi_down.iloc[-1] < 10.0
+def test_aggregate_candles_into_20min_buckets() -> None:
+    # Build 60 1-min bars starting at 9:30 ET on a single day.
+    idx = pd.date_range("2026-05-11 09:30", periods=60, freq="1min", tz="America/New_York")
+    df = pd.DataFrame({
+        "open": [float(i) for i in range(60)],
+        "high": [float(i) + 0.5 for i in range(60)],
+        "low": [float(i) - 0.5 for i in range(60)],
+        "close": [float(i) + 0.1 for i in range(60)],
+        "volume": [100] * 60,
+    }, index=idx)
+    agg = _aggregate_candles(df, 20)
+    # 60 min / 20 = 3 candles
+    assert len(agg) == 3
+    # First candle: open = bar 0's open (0.0), close = bar 19's close (19.1)
+    assert agg.iloc[0]["open"] == 0.0
+    assert agg.iloc[0]["close"] == 19.1
+    # Labels at 9:30, 9:50, 10:10
+    assert agg.index[0].hour == 9 and agg.index[0].minute == 30
+    assert agg.index[1].hour == 9 and agg.index[1].minute == 50
+    assert agg.index[2].hour == 10 and agg.index[2].minute == 10
 
 
 def test_sweep_grid_dimensions() -> None:
-    # 4 profit scenarios x 10 stop scenarios = 40 configs
-    assert len(PROFIT_SCENARIOS) == 4
-    assert len(STOP_SCENARIOS) == 10
-    # exactly one of (pct, minutes) is non-zero per stop scenario
-    for sl_pct, sl_min in STOP_SCENARIOS:
-        assert (sl_pct > 0 and sl_min == 0) or (sl_pct == 0 and sl_min > 0)
+    # 2 DTE x 5 PT x 4 SL = 40 configs
+    assert len(DTE_VALUES) == 2
+    assert len(PROFIT_SCENARIOS) == 5
+    assert len(STOP_SCENARIOS) == 4
+    assert len(DTE_VALUES) * len(PROFIT_SCENARIOS) * len(STOP_SCENARIOS) == 40
