@@ -265,9 +265,12 @@ def _find_clustered_signal(
     params: StrategyParams,
     underlying: str = "SPY",
 ) -> Signal | None:
-    """Scan ATM-area 0DTE trade tape for the first 1-min candle on a single
-    contract containing >= params.cluster_min_trades buy-aggressor prints of
-    size >= params.size_threshold."""
+    """Scan ATM-area 0DTE trade tape for the first 1-min candle in which
+    >= params.cluster_min_trades buy-aggressor prints of size >=
+    params.size_threshold land on contracts in the SAME direction
+    (all calls OR all puts) anywhere inside the ATM strike window.
+    Clusters can span adjacent strikes — catches sweeps that route
+    across multiple strikes on the same side."""
     if today_1min_spy.empty:
         return None
     if params.skip_fridays:
@@ -291,13 +294,14 @@ def _find_clustered_signal(
     threshold = params.size_threshold
     min_count = max(1, int(params.cluster_min_trades))
 
-    best: tuple[pd.Timestamp, Signal] | None = None
-    n_clusters_found = 0
+    # Aggregate qualifying buy-aggressor prints across all contracts in the
+    # window, keyed by (right, minute) so calls and puts cluster separately.
+    by_dir_minute: dict[tuple[str, pd.Timestamp], list[dict]] = {}
     n_large_total = 0
     n_multi_leg_total = 0
     n_sell_total = 0
     n_buy_kept_total = 0
-    max_per_minute_seen = 0
+
     for c in nearby:
         try:
             strike = float(c["strike_price"])
@@ -321,8 +325,6 @@ def _find_clustered_signal(
             continue
         bars = _to_et(bars)
 
-        # Build per-minute groups of qualifying buy-aggressor prints.
-        by_minute: dict[pd.Timestamp, list[dict]] = {}
         for _, row in big.iterrows():
             n_large_total += 1
             if params.exclude_multi_leg and _is_multi_leg(row.get("conditions")):
@@ -346,54 +348,65 @@ def _find_clustered_signal(
                     n_sell_total += 1
                 continue
             n_buy_kept_total += 1
-            by_minute.setdefault(minute, []).append({
+            by_dir_minute.setdefault((right, minute), []).append({
                 "ts": ts,
                 "price": trade_price,
                 "size": int(row["size"]),
                 "bar_open": bar_open,
+                "strike": strike,
+                "right": right,
             })
-        if by_minute:
-            local_max = max(len(rs) for rs in by_minute.values())
-            if local_max > max_per_minute_seen:
-                max_per_minute_seen = local_max
 
-        # Earliest minute on this contract with >= min_count qualifying prints.
-        qualifying = sorted(
-            (m for m, rs in by_minute.items() if len(rs) >= min_count)
-        )
-        if not qualifying:
-            continue
-        minute = qualifying[0]
-        rows_sorted = sorted(by_minute[minute], key=lambda r: r["ts"])
-        trigger = rows_sorted[-1]  # last print in the cluster
-        n_clusters_found += 1
+    max_per_minute = max((len(rs) for rs in by_dir_minute.values()), default=0)
 
-        total_size = sum(r["size"] for r in by_minute[minute])
-        entry_minute = minute + pd.Timedelta(minutes=1)
-        sig = Signal(
-            timestamp=entry_minute,
-            print_timestamp=trigger["ts"],
-            contract=ticker,
-            strike=strike,
-            right=right,
-            size=total_size,  # combined size across the cluster
-            trade_price=trigger["price"],
-            bar_open=(
-                trigger["bar_open"]
-                if trigger["bar_open"] is not None
-                else float("nan")
-            ),
-        )
-        if best is None or trigger["ts"] < best[0]:
-            best = (trigger["ts"], sig)
+    qualifying: list[tuple[pd.Timestamp, str, list[dict]]] = [
+        (minute, right, rs)
+        for (right, minute), rs in by_dir_minute.items()
+        if len(rs) >= min_count
+    ]
+    n_clusters_found = len(qualifying)
 
     log.debug(
-        "%s [clustered S>=%d N>=%d]: large=%d multi_leg=%d sell=%d buy_kept=%d "
-        "max_per_minute=%d clusters_found=%d",
+        "%s [clustered S>=%d N>=%d, cross-strike same-dir]: large=%d "
+        "multi_leg=%d sell=%d buy_kept=%d max_per_minute=%d clusters_found=%d",
         day, threshold, min_count,
         n_large_total, n_multi_leg_total, n_sell_total, n_buy_kept_total,
-        max_per_minute_seen, n_clusters_found,
+        max_per_minute, n_clusters_found,
     )
-    if best is None:
+
+    if not qualifying:
         return None
-    return best[1]
+
+    # Earliest qualifying minute wins.
+    qualifying.sort(key=lambda q: q[0])
+    minute, right, prints = qualifying[0]
+
+    # Pick the dominant strike (most prints in the cluster, tiebreak by
+    # closest to ATM) as the contract we'll actually trade.
+    by_strike: dict[float, list[dict]] = {}
+    for p in prints:
+        by_strike.setdefault(p["strike"], []).append(p)
+    best_strike = max(
+        by_strike.keys(),
+        key=lambda s: (len(by_strike[s]), -abs(s - spot_at_open)),
+    )
+    strike_prints = by_strike[best_strike]
+    trigger = max(strike_prints, key=lambda p: p["ts"])
+
+    total_size = sum(p["size"] for p in prints)
+    entry_minute = minute + pd.Timedelta(minutes=1)
+    ticker = build_option_ticker(underlying, day, right, best_strike)
+    return Signal(
+        timestamp=entry_minute,
+        print_timestamp=trigger["ts"],
+        contract=ticker,
+        strike=best_strike,
+        right=right,
+        size=total_size,
+        trade_price=trigger["price"],
+        bar_open=(
+            trigger["bar_open"]
+            if trigger["bar_open"] is not None
+            else float("nan")
+        ),
+    )
