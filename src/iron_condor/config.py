@@ -29,6 +29,15 @@ class StrategyParams:
     spread_width: float = 2.0              # $ between short and long strike
     strike_step: float = 1.0               # SPY $1 strikes at ATM
 
+    # -- Regime filters --
+    # VIX: skip the day if prior trading day's VIX close was above vix_max.
+    vix_filter_enabled: bool = True
+    vix_max: float = 22.0
+    # SPY gap: skip the day if (today_open - prior_close) / prior_close is below
+    # gap_min_pct. Negative number = down-gap threshold (e.g. -0.005 = -0.5%).
+    gap_filter_enabled: bool = True
+    gap_min_pct: float = -0.005
+
     # -- Exits --
     profit_target_pct: float = 0.50        # % of credit captured to take profit
     stop_loss_mult: float = 2.0            # SL fires when unrealized loss = N × credit

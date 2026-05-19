@@ -108,6 +108,30 @@ def _empty_result(day: date, params: StrategyParams, balance: float, reason: str
     )
 
 
+def _prior_trading_day(day: date) -> date:
+    return (pd.Timestamp(day) - pd.tseries.offsets.BusinessDay(1)).date()
+
+
+def _spy_prior_close(client: PolygonClient, day: date) -> float | None:
+    """Return SPY's prior trading day regular-session close, or None."""
+    prior = _prior_trading_day(day)
+    bars = client.get_minute_bars(UNDERLYING, prior)
+    if bars.empty:
+        return None
+    et = bars.copy()
+    et.index = bars.index.tz_convert("America/New_York")
+    rth = et[
+        (et.index.time >= time(9, 30))
+        & (et.index.time < time(16, 0))
+    ]
+    if rth.empty:
+        return None
+    last = rth.iloc[-1]["close"]
+    if pd.isna(last):
+        return None
+    return float(last)
+
+
 def simulate_day(
     day: date,
     params: StrategyParams,
@@ -117,6 +141,31 @@ def simulate_day(
     today_bars = client.get_minute_bars(UNDERLYING, day)
     if today_bars.empty:
         return _empty_result(day, params, balance, "no_data")
+
+    # Regime filter: VIX prior-day close
+    if params.vix_filter_enabled:
+        vix = client.get_vix_close(_prior_trading_day(day))
+        if vix is not None and vix > params.vix_max:
+            log.debug("%s: VIX prior close %.2f > %.2f, skipping",
+                      day, vix, params.vix_max)
+            return _empty_result(day, params, balance, "vix_filter")
+
+    # Regime filter: SPY overnight gap (today's 9:30 open vs prior 16:00 close)
+    if params.gap_filter_enabled:
+        prior_close = _spy_prior_close(client, day)
+        if prior_close is not None:
+            et = today_bars.copy()
+            et.index = today_bars.index.tz_convert("America/New_York")
+            today_open_bars = et[et.index.time == time(9, 30)]
+            if not today_open_bars.empty:
+                today_open = float(today_open_bars.iloc[0]["open"])
+                gap_pct = (today_open - prior_close) / prior_close
+                if gap_pct < params.gap_min_pct:
+                    log.debug(
+                        "%s: gap %.3f%% below threshold %.3f%%, skipping",
+                        day, gap_pct * 100, params.gap_min_pct * 100,
+                    )
+                    return _empty_result(day, params, balance, "gap_filter")
 
     contracts = client.get_option_contracts(UNDERLYING, day)  # 0DTE
     if not contracts:
@@ -283,6 +332,10 @@ def run_sweep(
             short_otm_pct=otm,
             spread_width=w,
             strike_step=base.strike_step,
+            vix_filter_enabled=base.vix_filter_enabled,
+            vix_max=base.vix_max,
+            gap_filter_enabled=base.gap_filter_enabled,
+            gap_min_pct=base.gap_min_pct,
             profit_target_pct=pt,
             stop_loss_mult=sl,
             commission_per_contract=base.commission_per_contract,

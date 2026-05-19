@@ -56,6 +56,8 @@ def summarize_run(trades: pd.DataFrame, starting_balance: float) -> dict:
             "stop_exits": 0,
             "time_exits": 0,
             "hard_close_exits": 0,
+            "skipped_vix": int((trades["exit_reason"] == "vix_filter").sum()),
+            "skipped_gap": int((trades["exit_reason"] == "gap_filter").sum()),
         }
 
     ending = float(taken["balance_after"].iloc[-1])
@@ -79,6 +81,8 @@ def summarize_run(trades: pd.DataFrame, starting_balance: float) -> dict:
         "stop_exits": int((taken["exit_reason"] == "stop").sum()),
         "time_exits": int((taken["exit_reason"] == "time_stop").sum()),
         "hard_close_exits": int((taken["exit_reason"] == "hard_close").sum()),
+        "skipped_vix": int((trades["exit_reason"] == "vix_filter").sum()),
+        "skipped_gap": int((trades["exit_reason"] == "gap_filter").sum()),
     }
 
 
@@ -102,6 +106,8 @@ def summarize_sweep(sweep: pd.DataFrame, starting_balance: float) -> pd.DataFram
         "stop_exits",
         "time_exits",
         "hard_close_exits",
+        "skipped_vix",
+        "skipped_gap",
         "n_days",
     ]
     return df[cols].sort_values("total_return_pct", ascending=False)

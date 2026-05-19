@@ -157,6 +157,34 @@ class PolygonClient:
         return d / f"{safe}.{ext}"
 
     # ------------------------------------------------------------------
+    # VIX daily close (regime filter)
+    # ------------------------------------------------------------------
+
+    def get_vix_close(self, day: date, force: bool = False) -> float | None:
+        """Return VIX closing value for `day`. None if Polygon has no data."""
+        cache = self._cache_path("vix_daily", day.isoformat(), "json")
+        if cache.exists() and not force:
+            payload = json.loads(cache.read_text())
+            return payload.get("close")
+        path = f"/v2/aggs/ticker/I:VIX/range/1/day/{day}/{day}"
+        try:
+            data = self._get(
+                path, {"adjusted": "true", "sort": "asc", "limit": 1}
+            )
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code in (403, 404):
+                log.warning("Polygon VIX %s -> %s; treating as missing",
+                            day, e.response.status_code)
+                return None
+            raise
+        results = data.get("results") or []
+        if not results:
+            return None
+        close = float(results[0]["c"])
+        cache.write_text(json.dumps({"close": close}))
+        return close
+
+    # ------------------------------------------------------------------
     # Stocks: SPY 1-min bars
     # ------------------------------------------------------------------
 
