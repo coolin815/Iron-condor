@@ -1,13 +1,17 @@
-"""Per-day backtest engine for the SPY 20-min-candle trigger strategy.
+"""Per-day backtest engine for the SPY 0DTE short put credit spread.
 
 For each trading day:
-  1. Pull SPY 1-min bars; find the first 2-consecutive-direction 20-min pattern.
-  2. If a signal fires, fetch the option chain for the chosen expiry (0DTE or 2DTE),
-     pick the ATM strike, buy at the signal minute's option open.
-  3. Walk minute-by-minute. Exit on whichever fires first:
-       - profit target (% mid-to-mid in gross mode, % net after fees in net mode)
-       - stop loss (same % convention as PT, paired by pnl_mode)
-       - hard close (3:55 PM ET)
+  1. Pull SPY 1-min bars. Find signal at params.entry_time (spot snap + strike picks).
+  2. Fetch the option chain (0DTE puts), build the two leg tickers, get their bars.
+  3. Open the spread: sell short put at bid (= mid - h), buy long put at ask (= mid + h).
+     Net credit per share = short_bid - long_ask.
+  4. Position size: floor(capital / (max_loss_per_spread + commission_round_trip)).
+  5. Walk forward minute by minute. The spread is worth `cost_to_close` per share:
+       cost_to_close = (short_mid + h) - (long_mid - h)
+     P&L per spread = (entry_credit - cost_to_close) * 100.
+     Exit on PT (>= PT_pct * entry_credit_dollars),
+             SL (<= -SL_mult * entry_credit_dollars),
+             or hard close 3:55 PM.
 """
 from __future__ import annotations
 
@@ -21,13 +25,14 @@ import pandas as pd
 from tqdm import tqdm
 
 from .config import (
-    DTE_VALUES,
-    PROFIT_SCENARIOS,
-    STOP_SCENARIOS,
+    PROFIT_TARGETS,
+    SHORT_OTM_PCTS,
+    SPREAD_WIDTHS,
+    STOP_LOSS_MULTS,
     StrategyParams,
     UNDERLYING,
 )
-from .orb import Signal, _expiry_for_dte, find_signal
+from .orb import Signal, find_signal
 from .polygon_client import PolygonClient
 
 log = logging.getLogger(__name__)
@@ -37,26 +42,23 @@ log = logging.getLogger(__name__)
 class TradeResult:
     day: date
     # config
-    dte: int
-    pnl_mode: str
+    short_otm_pct: float
+    spread_width: float
     profit_target_pct: float
-    stop_loss_pct: float
+    stop_loss_mult: float
     # signal
     signal_time: datetime | None
-    contract: str | None
-    strike: float | None
-    right: str | None
-    direction: str | None
-    expiry: date | None
+    short_strike: float | None
+    long_strike: float | None
     spot_at_entry: float | None
     # position
     qty: int
-    entry_price: float | None
-    exit_price: float | None
+    entry_credit_per_share: float | None    # net credit received (positive)
+    exit_cost_per_share: float | None       # cost to close spread (positive when adverse)
     exit_time: datetime | None
     minutes_held: float | None
     exit_reason: str
-    gross_pnl: float
+    gross_pnl: float                        # before commissions
     fees: float
     net_pnl: float
     balance_after: float
@@ -91,15 +93,16 @@ def _leg_price(bars: pd.DataFrame, ts: pd.Timestamp, column: str = "close") -> f
 def _empty_result(day: date, params: StrategyParams, balance: float, reason: str) -> TradeResult:
     return TradeResult(
         day=day,
-        dte=params.dte,
-        pnl_mode=params.pnl_mode,
+        short_otm_pct=params.short_otm_pct,
+        spread_width=params.spread_width,
         profit_target_pct=params.profit_target_pct,
-        stop_loss_pct=params.stop_loss_pct,
+        stop_loss_mult=params.stop_loss_mult,
         signal_time=None,
-        contract=None, strike=None, right=None, direction=None,
-        expiry=None, spot_at_entry=None,
-        qty=0, entry_price=None, exit_price=None, exit_time=None,
-        minutes_held=None, exit_reason=reason,
+        short_strike=None, long_strike=None, spot_at_entry=None,
+        qty=0,
+        entry_credit_per_share=None, exit_cost_per_share=None,
+        exit_time=None, minutes_held=None,
+        exit_reason=reason,
         gross_pnl=0.0, fees=0.0, net_pnl=0.0,
         balance_after=balance,
     )
@@ -115,8 +118,7 @@ def simulate_day(
     if today_bars.empty:
         return _empty_result(day, params, balance, "no_data")
 
-    expiry = _expiry_for_dte(day, params.dte)
-    contracts = client.get_option_contracts(UNDERLYING, expiry)
+    contracts = client.get_option_contracts(UNDERLYING, day)  # 0DTE
     if not contracts:
         return _empty_result(day, params, balance, "no_data")
 
@@ -124,90 +126,106 @@ def simulate_day(
     if signal is None:
         return _empty_result(day, params, balance, "no_signal")
 
-    opt_bars = _reindex_option_bars(
-        client.get_option_minute_bars(signal.contract, day), day
+    short_bars = _reindex_option_bars(
+        client.get_option_minute_bars(signal.short_ticker, day), day
     )
-    if opt_bars.empty:
+    long_bars = _reindex_option_bars(
+        client.get_option_minute_bars(signal.long_ticker, day), day
+    )
+    if short_bars.empty or long_bars.empty:
         return _empty_result(day, params, balance, "no_data")
 
     entry_ts = signal.timestamp
-    entry_open = _leg_price(opt_bars, entry_ts, "open")
-    if entry_open is None or entry_open <= 0.05:
+    short_mid_entry = _leg_price(short_bars, entry_ts, "open")
+    long_mid_entry = _leg_price(long_bars, entry_ts, "open")
+    if short_mid_entry is None or long_mid_entry is None:
         return _empty_result(day, params, balance, "no_data")
 
     h = params.leg_half_spread
-    entry_mid = entry_open
-    entry_ask = entry_open + h
+    # Sell short put at bid; buy long put at ask. Net credit per share.
+    short_bid_entry = max(short_mid_entry - h, 0.0)
+    long_ask_entry = long_mid_entry + h
+    entry_credit = short_bid_entry - long_ask_entry  # per share
+
+    if entry_credit <= 0:
+        # Inversion (long leg priced richer than short — happens at very wide
+        # OTM where both legs are near zero). No edge to take.
+        return _empty_result(day, params, balance, "no_credit")
+
+    spread_width_dollars = (signal.short_strike - signal.long_strike) * 100
+    max_loss_per_spread = spread_width_dollars - entry_credit * 100
+    commission_round_trip = params.commission_per_contract * 4  # 2 legs × open + close
 
     capital = min(balance, params.max_capital_per_trade)
-    per_contract_open = entry_ask * 100 + params.commission_per_contract
-    qty = int(floor(capital / per_contract_open))
+    per_spread_capital = max_loss_per_spread + commission_round_trip
+    qty = int(floor(capital / per_spread_capital)) if per_spread_capital > 0 else 0
     if qty < 1:
         return _empty_result(day, params, balance, "no_data")
+
+    entry_credit_dollars = entry_credit * 100
+    pt_target_dollars = params.profit_target_pct * entry_credit_dollars
+    sl_threshold_dollars = -params.stop_loss_mult * entry_credit_dollars
 
     hard_close_ts = pd.Timestamp(
         datetime.combine(day, params.hard_close)
     ).tz_localize("America/New_York")
-    forward = opt_bars.index[(opt_bars.index > entry_ts) & (opt_bars.index <= hard_close_ts)]
-    use_net = params.pnl_mode == "net"
+    forward = short_bars.index[
+        (short_bars.index > entry_ts) & (short_bars.index <= hard_close_ts)
+    ]
 
     exit_ts: pd.Timestamp | None = None
-    exit_bid: float | None = None
+    exit_cost: float | None = None
     exit_reason = "hard_close"
 
     for ts in forward:
-        mid = _leg_price(opt_bars, ts, "close")
-        if mid is None:
+        short_mid = _leg_price(short_bars, ts, "close")
+        long_mid = _leg_price(long_bars, ts, "close")
+        if short_mid is None or long_mid is None:
             continue
-        bid = mid - h
-        # SL is always evaluated on gross (mid-to-mid).
-        gross_pct = (mid - entry_mid) / entry_mid
-        if use_net:
-            gross_val = (bid - entry_ask) * 100 * qty
-            fees_val = 2 * params.commission_per_contract * qty
-            net_val = gross_val - fees_val
-            capital_deployed = entry_ask * 100 * qty + params.commission_per_contract * qty
-            pt_pct = net_val / capital_deployed
-        else:
-            pt_pct = gross_pct
+        # To close: buy back short at ask, sell long at bid.
+        short_ask_close = short_mid + h
+        long_bid_close = max(long_mid - h, 0.0)
+        cost_to_close = short_ask_close - long_bid_close  # per share, positive normally
+        pnl_per_spread = (entry_credit - cost_to_close) * 100
 
-        if pt_pct >= params.profit_target_pct:
-            exit_ts, exit_bid, exit_reason = ts, bid, "profit"
+        if pnl_per_spread >= pt_target_dollars:
+            exit_ts, exit_cost, exit_reason = ts, cost_to_close, "profit"
             break
-        if gross_pct <= -params.stop_loss_pct:
-            exit_ts, exit_bid, exit_reason = ts, bid, "stop"
+        if pnl_per_spread <= sl_threshold_dollars:
+            exit_ts, exit_cost, exit_reason = ts, cost_to_close, "stop"
             break
 
     if exit_ts is None:
-        cand = opt_bars.index[opt_bars.index <= hard_close_ts]
+        cand = short_bars.index[short_bars.index <= hard_close_ts]
         if len(cand) == 0:
             return _empty_result(day, params, balance, "no_data")
         exit_ts = cand[-1]
-        exit_mid = _leg_price(opt_bars, exit_ts, "close")
-        if exit_mid is None:
+        short_mid = _leg_price(short_bars, exit_ts, "close")
+        long_mid = _leg_price(long_bars, exit_ts, "close")
+        if short_mid is None or long_mid is None:
             return _empty_result(day, params, balance, "no_data")
-        exit_bid = exit_mid - h
+        short_ask_close = short_mid + h
+        long_bid_close = max(long_mid - h, 0.0)
+        exit_cost = short_ask_close - long_bid_close
 
-    gross = (exit_bid - entry_ask) * 100 * qty
-    fees = 2 * params.commission_per_contract * qty
+    pnl_per_spread = (entry_credit - exit_cost) * 100
+    gross = pnl_per_spread * qty
+    fees = commission_round_trip * qty
     net = gross - fees
 
     return TradeResult(
         day=day,
-        dte=params.dte,
-        pnl_mode=params.pnl_mode,
+        short_otm_pct=params.short_otm_pct,
+        spread_width=params.spread_width,
         profit_target_pct=params.profit_target_pct,
-        stop_loss_pct=params.stop_loss_pct,
+        stop_loss_mult=params.stop_loss_mult,
         signal_time=entry_ts.to_pydatetime(),
-        contract=signal.contract,
-        strike=signal.strike,
-        right=signal.right,
-        direction=signal.direction,
-        expiry=signal.expiry,
+        short_strike=signal.short_strike,
+        long_strike=signal.long_strike,
         spot_at_entry=signal.spot_at_entry,
         qty=qty,
-        entry_price=entry_ask,
-        exit_price=exit_bid,
+        entry_credit_per_share=entry_credit,
+        exit_cost_per_share=exit_cost,
         exit_time=exit_ts.to_pydatetime(),
         minutes_held=(exit_ts - entry_ts).total_seconds() / 60.0,
         exit_reason=exit_reason,
@@ -229,8 +247,8 @@ def run_backtest(
     balance = params.starting_balance
     results: list[TradeResult] = []
     desc = (
-        f"d{params.dte}|pt{int(params.profit_target_pct * 100)}{params.pnl_mode[0]}"
-        f"|sl{int(params.stop_loss_pct * 100)}"
+        f"otm{int(params.short_otm_pct * 1000)/10:.1f}|w{int(params.spread_width)}"
+        f"|pt{int(params.profit_target_pct * 100)}|sl{params.stop_loss_mult:g}x"
     )
     for day in tqdm(days, desc=desc):
         result = simulate_day(day, params, balance, client)
@@ -242,9 +260,10 @@ def run_backtest(
 def run_sweep(
     start: date,
     end: date,
-    dte_values: Iterable[int] = DTE_VALUES,
-    profit_scenarios: Iterable[tuple[float, str]] = PROFIT_SCENARIOS,
-    stop_scenarios: Iterable[float] = STOP_SCENARIOS,
+    short_otm_pcts: Iterable[float] = SHORT_OTM_PCTS,
+    spread_widths: Iterable[float] = SPREAD_WIDTHS,
+    profit_targets: Iterable[float] = PROFIT_TARGETS,
+    stop_loss_mults: Iterable[float] = STOP_LOSS_MULTS,
     base_params: StrategyParams | None = None,
     client: PolygonClient | None = None,
 ) -> pd.DataFrame:
@@ -252,20 +271,20 @@ def run_sweep(
     base = base_params or StrategyParams()
     all_rows: list[pd.DataFrame] = []
 
-    combos = [(d, pt, mode, sl)
-              for d in dte_values
-              for (pt, mode) in profit_scenarios
-              for sl in stop_scenarios]
-    for d, pt, mode, sl in combos:
+    combos = [(otm, w, pt, sl)
+              for otm in short_otm_pcts
+              for w in spread_widths
+              for pt in profit_targets
+              for sl in stop_loss_mults]
+    for otm, w, pt, sl in combos:
         params = StrategyParams(
-            candle_minutes=base.candle_minutes,
-            latest_entry=base.latest_entry,
-            dte=d,
-            strike_step=base.strike_step,
+            entry_time=base.entry_time,
             hard_close=base.hard_close,
+            short_otm_pct=otm,
+            spread_width=w,
+            strike_step=base.strike_step,
             profit_target_pct=pt,
-            stop_loss_pct=sl,
-            pnl_mode=mode,  # type: ignore[arg-type]
+            stop_loss_mult=sl,
             commission_per_contract=base.commission_per_contract,
             leg_half_spread=base.leg_half_spread,
             starting_balance=base.starting_balance,
@@ -273,7 +292,8 @@ def run_sweep(
         )
         df = run_backtest(params, start, end, client=client)
         df["config"] = (
-            f"d{d}|pt{int(pt*100)}{mode[0]}|sl{int(sl*100)}"
+            f"otm{int(otm * 1000)/10:.1f}|w{int(w)}"
+            f"|pt{int(pt * 100)}|sl{sl:g}x"
         )
         all_rows.append(df)
     return pd.concat(all_rows, ignore_index=True)

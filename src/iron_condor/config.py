@@ -1,20 +1,13 @@
-"""Strategy parameters for the SPY consecutive-20min-candle trigger.
+"""Strategy parameters for SPY 0DTE short put credit spread.
 
-Entry trigger (each trading day, anchored at 9:30 ET):
-  - Build 20-min OHLC candles: [9:30, 9:50), [9:50, 10:10), [10:10, 10:30), ...
-  - A candle is "green" if close > open, "red" if close < open. Doji breaks streak.
-  - On the first occurrence of two consecutive same-direction candles, fire signal.
-  - Entry fills at the OPEN of the NEXT 1-min candle after the 2nd 20-min candle closes.
-  - Latest possible entry time: params.latest_entry (default 12:30 ET == 9:30 PT).
-
-Position:
-  - ATM strike (nearest $1 to spot, round half up).
-  - 0 DTE or 2 DTE — swept as a dimension to compare.
-
-Exit:
-  - Profit target on mid-to-mid (gross) or net-after-fees (per pnl_mode).
-  - Stop loss as a % of capital (matches pnl_mode).
-  - Hard close at 3:55 PM ET fallback.
+Each trading day at params.entry_time:
+  1. Pick a target short-put strike = spot * (1 - short_otm_pct), rounded to $1.
+  2. Long-put strike = short - spread_width.
+  3. SELL the short put at bid, BUY the long put at ask. Net credit per share.
+  4. Hold until:
+       - PT: spread P&L >= profit_target_pct * credit (i.e. captured N% of credit)
+       - SL: spread P&L <= -stop_loss_mult * credit (lost N× the credit received)
+       - Hard close at 3:55 PM ET (avoid expiry pin risk)
 """
 from __future__ import annotations
 
@@ -27,32 +20,21 @@ UNDERLYING: str = "SPY"
 
 @dataclass(frozen=True)
 class StrategyParams:
-    # -- Entry trigger --
-    candle_minutes: int = 20
-    latest_entry: time = time(12, 30)      # 12:30 ET == 9:30 PT
+    # -- Entry --
+    entry_time: time = time(9, 35)
+    hard_close: time = time(15, 55)
 
-    # -- RSI extreme filter --
-    # Compute Wilder RSI(rsi_period) on same-day SPY 1-min closes. Over the
-    # last rsi_lookback_minutes 1-min bars of the 2nd 20-min trigger candle,
-    # if ANY RSI value is outside [rsi_min, rsi_max], skip the trade.
-    rsi_filter_enabled: bool = True
-    rsi_period: int = 14
-    rsi_lookback_minutes: int = 5
-    rsi_min: float = 30.0
-    rsi_max: float = 70.0
-
-    # -- Contract selection --
-    dte: int = 0                           # 0 (today's expiry) or 2 (today + 2 BD)
+    # -- Strike selection --
+    short_otm_pct: float = 0.01            # 1% OTM short strike (proxy for ~0.15 delta on 0DTE)
+    spread_width: float = 2.0              # $ between short and long strike
     strike_step: float = 1.0               # SPY $1 strikes at ATM
 
     # -- Exits --
-    hard_close: time = time(15, 55)
-    profit_target_pct: float = 0.05
-    stop_loss_pct: float = 0.20
-    pnl_mode: Literal["gross", "net"] = "gross"
+    profit_target_pct: float = 0.50        # % of credit captured to take profit
+    stop_loss_mult: float = 2.0            # SL fires when unrealized loss = N × credit
 
     # -- Execution --
-    commission_per_contract: float = 0.85
+    commission_per_contract: float = 0.85  # per leg per side — round trip = 4× this
     leg_half_spread: float = 0.01
 
     # -- Account --
@@ -60,17 +42,8 @@ class StrategyParams:
     max_capital_per_trade: float = 50000.0
 
 
-# Sweep grid — (profit_target_pct, pnl_mode) pairs
-PROFIT_SCENARIOS: tuple[tuple[float, str], ...] = (
-    (0.03, "gross"),
-    (0.03, "net"),
-    (0.05, "gross"),
-    (0.05, "net"),
-    (0.10, "gross"),
-)
-
-# Sweep grid — stop_loss_pct values; mode is paired with PT's mode
-STOP_SCENARIOS: tuple[float, ...] = (0.15, 0.20, 0.25, 0.30)
-
-# Sweep grid — DTE values to compare
-DTE_VALUES: tuple[int, ...] = (0, 2)
+# Sweep grids
+SHORT_OTM_PCTS: tuple[float, ...] = (0.005, 0.010, 0.015, 0.020)
+SPREAD_WIDTHS: tuple[float, ...] = (2.0, 5.0)
+PROFIT_TARGETS: tuple[float, ...] = (0.25, 0.50, 0.75)
+STOP_LOSS_MULTS: tuple[float, ...] = (1.5, 2.0, 3.0)
