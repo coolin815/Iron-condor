@@ -77,6 +77,25 @@ def test_aggregate_candles_into_20min_buckets() -> None:
     assert agg.index[2].hour == 10 and agg.index[2].minute == 10
 
 
+def test_aggregate_candles_drops_premarket_bars() -> None:
+    # Pre-market 1-min bars from 4:00 AM, plus a few regular-session bars.
+    pre = pd.date_range("2026-05-11 04:00", "2026-05-11 09:29", freq="1min", tz="America/New_York")
+    rth = pd.date_range("2026-05-11 09:30", "2026-05-11 10:09", freq="1min", tz="America/New_York")
+    idx = pre.append(rth)
+    df = pd.DataFrame({
+        "open": [99.0] * len(idx),
+        "high": [99.5] * len(idx),
+        "low": [98.5] * len(idx),
+        "close": [99.0] * len(idx),
+        "volume": [10] * len(idx),
+    }, index=idx)
+    agg = _aggregate_candles(df, 20)
+    # Two RTH candles (9:30-9:50 and 9:50-10:10), no pre-market candles.
+    assert len(agg) == 2
+    assert agg.index[0].hour == 9 and agg.index[0].minute == 30
+    assert agg.index[1].hour == 9 and agg.index[1].minute == 50
+
+
 def test_sweep_grid_dimensions() -> None:
     # 2 DTE x 5 PT x 4 SL = 40 configs
     assert len(DTE_VALUES) == 2

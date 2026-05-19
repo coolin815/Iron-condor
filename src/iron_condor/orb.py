@@ -57,14 +57,23 @@ def _to_et(bars: pd.DataFrame) -> pd.DataFrame:
 
 
 def _aggregate_candles(bars: pd.DataFrame, minutes: int) -> pd.DataFrame:
-    """Resample ET-indexed 1-min bars into N-min OHLC. Anchors on the first bar
-    (which is 9:30 ET in practice). Label is the LEFT edge of each bucket so
-    bucket label + minutes == bucket close time."""
+    """Resample ET-indexed 1-min bars into N-min OHLC anchored at 9:30 ET.
+    Pre- and post-market bars are dropped so the buckets align to the
+    regular session: [9:30, 9:50), [9:50, 10:10), ..."""
     if bars.empty:
         return bars
-    origin = bars.index[0]
-    agg = bars.resample(
-        f"{minutes}min", origin=origin, label="left", closed="left",
+    day = bars.index[0].date()
+    rth_start = pd.Timestamp(
+        datetime.combine(day, time(9, 30))
+    ).tz_localize("America/New_York")
+    rth_end = pd.Timestamp(
+        datetime.combine(day, time(16, 0))
+    ).tz_localize("America/New_York")
+    rth = bars[(bars.index >= rth_start) & (bars.index < rth_end)]
+    if rth.empty:
+        return rth
+    agg = rth.resample(
+        f"{minutes}min", origin=rth_start, label="left", closed="left",
     ).agg({"open": "first", "high": "max", "low": "min",
            "close": "last", "volume": "sum"})
     return agg.dropna(subset=["open", "close"])
