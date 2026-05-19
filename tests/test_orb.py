@@ -74,8 +74,8 @@ def test_wilder_rsi_known_values() -> None:
 
 
 def test_sweep_grid_dimensions() -> None:
-    # 3 profit scenarios x 10 stop scenarios = 30 configs
-    assert len(PROFIT_SCENARIOS) == 3
+    # 4 profit scenarios x 10 stop scenarios = 40 configs
+    assert len(PROFIT_SCENARIOS) == 4
     assert len(STOP_SCENARIOS) == 10
     # exactly one of (pct, minutes) is non-zero per stop scenario
     for sl_pct, sl_min in STOP_SCENARIOS:

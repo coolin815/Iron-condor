@@ -55,9 +55,10 @@ class StrategyParams:
 
 # Sweep grid — (profit_target_pct, pnl_mode) pairs
 PROFIT_SCENARIOS: tuple[tuple[float, str], ...] = (
-    (0.05, "gross"),
-    (0.05, "net"),
-    (0.10, "gross"),
+    (0.02, "gross"),
+    (0.02, "net"),
+    (0.03, "gross"),
+    (0.03, "net"),
 )
 
 # Sweep grid — (stop_loss_pct, stop_loss_minutes) pairs. Exactly one is non-zero per row.
