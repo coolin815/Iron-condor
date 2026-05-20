@@ -97,7 +97,13 @@ def main(argv: list[str] | None = None) -> int:
             f"pt={[f'{p:.0%}' for p in PROFIT_TARGETS]}, "
             f"sl={[f'{s:g}x' for s in STOP_LOSS_MULTS]})"
         )
-        sweep_df = run_sweep(start, end, base_params=base_params, client=client)
+        sweep_df = run_sweep(
+            start,
+            end,
+            base_params=base_params,
+            client=client,
+            checkpoint_dir=RESULTS_DIR,
+        )
         sweep_df.to_csv(RESULTS_DIR / "sweep_trades.csv", index=False)
         summary = summarize_sweep(sweep_df, base_params.starting_balance)
         summary.to_csv(RESULTS_DIR / "sweep_summary.csv", index=False)

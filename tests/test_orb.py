@@ -40,9 +40,9 @@ def test_nearest_strike_empty_returns_none() -> None:
 
 
 def test_sweep_grid_dimensions() -> None:
-    assert len(SHORT_OTM_PCTS) == 4
+    assert len(SHORT_OTM_PCTS) == 3
     assert len(SPREAD_WIDTHS) == 2
-    assert len(PROFIT_TARGETS) == 3
+    assert len(PROFIT_TARGETS) == 2
     assert len(STOP_LOSS_MULTS) == 3
     total = (
         len(SHORT_OTM_PCTS)
@@ -50,4 +50,4 @@ def test_sweep_grid_dimensions() -> None:
         * len(PROFIT_TARGETS)
         * len(STOP_LOSS_MULTS)
     )
-    assert total == 72
+    assert total == 36

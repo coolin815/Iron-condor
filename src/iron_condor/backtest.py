@@ -381,7 +381,13 @@ def run_sweep(
     filter_modes: Iterable[tuple[str, bool, bool, str]] = FILTER_MODES,
     base_params: StrategyParams | None = None,
     client: PolygonClient | None = None,
+    checkpoint_dir: "Path | None" = None,
 ) -> pd.DataFrame:
+    """Run the full sweep. If `checkpoint_dir` is given, write sweep_trades.csv
+    and sweep_summary.csv after EACH config completes, so an interrupted run
+    leaves partial results on disk."""
+    from .metrics import summarize_sweep
+
     client = client or PolygonClient()
     base = base_params or StrategyParams()
     all_rows: list[pd.DataFrame] = []
@@ -392,7 +398,7 @@ def run_sweep(
               for w in spread_widths
               for pt in profit_targets
               for sl in stop_loss_mults]
-    for mode_label, on_off, otm, w, pt, sl in combos:
+    for idx, (mode_label, on_off, otm, w, pt, sl) in enumerate(combos, 1):
         overnight_on, premarket_on, combine = on_off
         params = StrategyParams(
             entry_time=base.entry_time,
@@ -420,4 +426,15 @@ def run_sweep(
             f"|pt{int(pt * 100)}|sl{sl:g}x"
         )
         all_rows.append(df)
+
+        if checkpoint_dir is not None:
+            partial = pd.concat(all_rows, ignore_index=True)
+            partial.to_csv(checkpoint_dir / "sweep_trades.csv", index=False)
+            summarize_sweep(partial, base.starting_balance).to_csv(
+                checkpoint_dir / "sweep_summary.csv", index=False
+            )
+            log.info(
+                "Checkpoint after config %d/%d (%s)",
+                idx, len(combos), df["config"].iloc[0],
+            )
     return pd.concat(all_rows, ignore_index=True)

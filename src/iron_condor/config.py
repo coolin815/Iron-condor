@@ -60,15 +60,14 @@ class StrategyParams:
 
 
 # Sweep grids
-SHORT_OTM_PCTS: tuple[float, ...] = (0.005, 0.010, 0.015, 0.020)
+SHORT_OTM_PCTS: tuple[float, ...] = (0.005, 0.010, 0.015)
 SPREAD_WIDTHS: tuple[float, ...] = (2.0, 5.0)
-PROFIT_TARGETS: tuple[float, ...] = (0.25, 0.50, 0.75)
+PROFIT_TARGETS: tuple[float, ...] = (0.25, 0.50)
 STOP_LOSS_MULTS: tuple[float, ...] = (1.5, 2.0, 3.0)
 
 # Regime filter modes — (label, overnight_on, premarket_on, combine_logic)
 # Used as a sweep dimension to compare overnight vs premarket vs combined.
 FILTER_MODES: tuple[tuple[str, bool, bool, str], ...] = (
-    ("none",      False, False, "any"),
     ("overnight", True,  False, "any"),
     ("premarket", False, True,  "any"),
     ("either",    True,  True,  "any"),
