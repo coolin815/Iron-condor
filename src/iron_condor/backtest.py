@@ -27,14 +27,15 @@ from tqdm import tqdm
 from .config import (
     FILTER_MODES,
     PROFIT_TARGETS,
+    ROLL_MODES,
     SHORT_OTM_PCTS,
     SPREAD_WIDTHS,
     STOP_LOSS_MULTS,
     StrategyParams,
     UNDERLYING,
 )
-from .orb import Signal, find_signal
-from .polygon_client import PolygonClient
+from .orb import Signal, _nearest_strike, find_signal
+from .polygon_client import PolygonClient, build_option_ticker
 
 log = logging.getLogger(__name__)
 
@@ -59,10 +60,11 @@ class TradeResult:
     exit_time: datetime | None
     minutes_held: float | None
     exit_reason: str
-    gross_pnl: float                        # before commissions
-    fees: float
+    gross_pnl: float                        # before commissions (chain total if rolled)
+    fees: float                             # round-trip commissions × qty × (1 + roll_count)
     net_pnl: float
     balance_after: float
+    roll_count: int = 0                     # number of successful same-day rolls in this chain
 
 
 def _trading_days(start: date, end: date) -> list[date]:
@@ -224,6 +226,16 @@ def simulate_day(
     if not contracts:
         return _empty_result(day, params, balance, "no_data")
 
+    # Cache the chain's put strikes (used for picking roll strikes intraday).
+    put_strikes: set[float] = set()
+    for c in contracts:
+        if c.get("contract_type", "").lower() != "put":
+            continue
+        try:
+            put_strikes.add(float(c["strike_price"]))
+        except (TypeError, ValueError, KeyError):
+            continue
+
     signal = find_signal(today_bars, contracts, client, params, UNDERLYING)
     if signal is None:
         return _empty_result(day, params, balance, "no_signal")
@@ -264,55 +276,137 @@ def simulate_day(
     if qty < 1:
         return _empty_result(day, params, balance, "no_data")
 
-    entry_credit_dollars = entry_credit * 100
-    pt_target_dollars = params.profit_target_pct * entry_credit_dollars
-    sl_threshold_dollars = -params.stop_loss_mult * entry_credit_dollars
-
     hard_close_ts = pd.Timestamp(
         datetime.combine(day, params.hard_close)
     ).tz_localize("America/New_York")
-    forward = short_bars.index[
-        (short_bars.index > entry_ts) & (short_bars.index <= hard_close_ts)
-    ]
 
-    exit_ts: pd.Timestamp | None = None
-    exit_cost: float | None = None
-    exit_reason = "hard_close"
+    # Position chain: each iteration walks one open spread to PT/SL/hard_close.
+    # On a non-final stop with rolling enabled, close this leg and open a new
+    # one at fresh strikes for the rest of today.
+    chain_gross_pnl = 0.0
+    chain_fees = 0.0
+    roll_count = 0
 
-    for ts in forward:
-        short_mid = _leg_price(short_bars, ts, "close")
-        long_mid = _leg_price(long_bars, ts, "close")
-        if short_mid is None or long_mid is None:
-            continue
-        # To close: buy back short at ask, sell long at bid.
-        short_ask_close = short_mid + h
-        long_bid_close = max(long_mid - h, 0.0)
-        cost_to_close = short_ask_close - long_bid_close  # per share, positive normally
-        pnl_per_spread = (entry_credit - cost_to_close) * 100
+    cur_short_bars = short_bars
+    cur_long_bars = long_bars
+    cur_entry_ts = entry_ts
+    cur_entry_credit = entry_credit
 
-        if pnl_per_spread >= pt_target_dollars:
-            exit_ts, exit_cost, exit_reason = ts, cost_to_close, "profit"
+    final_exit_ts: pd.Timestamp | None = None
+    final_exit_cost: float | None = None
+    final_exit_reason = "hard_close"
+
+    while True:
+        pt_target_dollars = params.profit_target_pct * cur_entry_credit * 100
+        sl_threshold_dollars = -params.stop_loss_mult * cur_entry_credit * 100
+
+        leg_exit_ts: pd.Timestamp | None = None
+        leg_exit_cost: float | None = None
+        leg_exit_reason = "hard_close"
+
+        forward = cur_short_bars.index[
+            (cur_short_bars.index > cur_entry_ts)
+            & (cur_short_bars.index <= hard_close_ts)
+        ]
+        for ts in forward:
+            short_mid = _leg_price(cur_short_bars, ts, "close")
+            long_mid = _leg_price(cur_long_bars, ts, "close")
+            if short_mid is None or long_mid is None:
+                continue
+            short_ask_close = short_mid + h
+            long_bid_close = max(long_mid - h, 0.0)
+            cost_to_close = short_ask_close - long_bid_close
+            pnl_per_spread = (cur_entry_credit - cost_to_close) * 100
+            if pnl_per_spread >= pt_target_dollars:
+                leg_exit_ts, leg_exit_cost, leg_exit_reason = ts, cost_to_close, "profit"
+                break
+            if pnl_per_spread <= sl_threshold_dollars:
+                leg_exit_ts, leg_exit_cost, leg_exit_reason = ts, cost_to_close, "stop"
+                break
+
+        if leg_exit_ts is None:
+            # hard_close
+            cand = cur_short_bars.index[cur_short_bars.index <= hard_close_ts]
+            if len(cand) == 0:
+                return _empty_result(day, params, balance, "no_data")
+            leg_exit_ts = cand[-1]
+            short_mid = _leg_price(cur_short_bars, leg_exit_ts, "close")
+            long_mid = _leg_price(cur_long_bars, leg_exit_ts, "close")
+            if short_mid is None or long_mid is None:
+                return _empty_result(day, params, balance, "no_data")
+            short_ask_close = short_mid + h
+            long_bid_close = max(long_mid - h, 0.0)
+            leg_exit_cost = short_ask_close - long_bid_close
+            leg_exit_reason = "hard_close"
+
+        leg_pnl_per_spread = (cur_entry_credit - leg_exit_cost) * 100
+        chain_gross_pnl += leg_pnl_per_spread * qty
+        chain_fees += commission_round_trip * qty
+        final_exit_ts = leg_exit_ts
+        final_exit_cost = leg_exit_cost
+        final_exit_reason = leg_exit_reason
+
+        # Roll decision: only on stop, only if room left in chain & in the day.
+        if not params.rolling_enabled or leg_exit_reason != "stop":
             break
-        if pnl_per_spread <= sl_threshold_dollars:
-            exit_ts, exit_cost, exit_reason = ts, cost_to_close, "stop"
+        if roll_count >= params.max_rolls:
+            break
+        if (hard_close_ts - leg_exit_ts).total_seconds() < 30 * 60:
             break
 
-    if exit_ts is None:
-        cand = short_bars.index[short_bars.index <= hard_close_ts]
-        if len(cand) == 0:
-            return _empty_result(day, params, balance, "no_data")
-        exit_ts = cand[-1]
-        short_mid = _leg_price(short_bars, exit_ts, "close")
-        long_mid = _leg_price(long_bars, exit_ts, "close")
-        if short_mid is None or long_mid is None:
-            return _empty_result(day, params, balance, "no_data")
-        short_ask_close = short_mid + h
-        long_bid_close = max(long_mid - h, 0.0)
-        exit_cost = short_ask_close - long_bid_close
+        # Pick new strikes from current spot.
+        spot_now = _leg_price(et, leg_exit_ts, "close")
+        if spot_now is None:
+            break
+        new_short_strike = _nearest_strike(
+            spot_now * (1 - params.short_otm_pct), params.strike_step, put_strikes
+        )
+        if new_short_strike is None:
+            break
+        new_long_strike = _nearest_strike(
+            new_short_strike - params.spread_width, params.strike_step, put_strikes
+        )
+        if new_long_strike is None or new_long_strike >= new_short_strike:
+            break
 
-    pnl_per_spread = (entry_credit - exit_cost) * 100
-    gross = pnl_per_spread * qty
-    fees = commission_round_trip * qty
+        new_short_ticker = build_option_ticker(UNDERLYING, day, "P", new_short_strike)
+        new_long_ticker = build_option_ticker(UNDERLYING, day, "P", new_long_strike)
+        new_short_bars = _reindex_option_bars(
+            client.get_option_minute_bars(new_short_ticker, day), day
+        )
+        new_long_bars = _reindex_option_bars(
+            client.get_option_minute_bars(new_long_ticker, day), day
+        )
+        if new_short_bars.empty or new_long_bars.empty:
+            break
+
+        next_mins = new_short_bars.index[new_short_bars.index > leg_exit_ts]
+        if len(next_mins) == 0:
+            break
+        new_entry_ts = next_mins[0]
+        new_short_mid = _leg_price(new_short_bars, new_entry_ts, "open")
+        new_long_mid = _leg_price(new_long_bars, new_entry_ts, "open")
+        if new_short_mid is None or new_long_mid is None:
+            break
+        new_short_bid = max(new_short_mid - h, 0.0)
+        new_long_ask = new_long_mid + h
+        new_entry_credit = new_short_bid - new_long_ask
+        if new_entry_credit <= 0:
+            break
+
+        roll_count += 1
+        cur_short_bars = new_short_bars
+        cur_long_bars = new_long_bars
+        cur_entry_ts = new_entry_ts
+        cur_entry_credit = new_entry_credit
+        log.debug(
+            "%s ROLL #%d at %s: spot=%.2f new_short=%.0fP new_long=%.0fP credit=%.3f",
+            day, roll_count, leg_exit_ts, spot_now,
+            new_short_strike, new_long_strike, new_entry_credit,
+        )
+
+    gross = chain_gross_pnl
+    fees = chain_fees
     net = gross - fees
 
     return TradeResult(
@@ -327,14 +421,16 @@ def simulate_day(
         spot_at_entry=signal.spot_at_entry,
         qty=qty,
         entry_credit_per_share=entry_credit,
-        exit_cost_per_share=exit_cost,
-        exit_time=exit_ts.to_pydatetime(),
-        minutes_held=(exit_ts - entry_ts).total_seconds() / 60.0,
-        exit_reason=exit_reason,
+        exit_cost_per_share=final_exit_cost,
+        exit_time=final_exit_ts.to_pydatetime() if final_exit_ts is not None else None,
+        minutes_held=(final_exit_ts - entry_ts).total_seconds() / 60.0
+            if final_exit_ts is not None else None,
+        exit_reason=final_exit_reason,
         gross_pnl=gross,
         fees=fees,
         net_pnl=net,
         balance_after=balance + net,
+        roll_count=roll_count,
     )
 
 
@@ -349,6 +445,12 @@ def _filter_mode_label(params: StrategyParams) -> str:
     return "either" if params.filter_combine == "any" else "both"
 
 
+def _roll_mode_label(params: StrategyParams) -> str:
+    if not params.rolling_enabled or params.max_rolls <= 0:
+        return "noroll"
+    return f"roll{params.max_rolls}"
+
+
 def run_backtest(
     params: StrategyParams,
     start: date,
@@ -360,7 +462,7 @@ def run_backtest(
     balance = params.starting_balance
     results: list[TradeResult] = []
     desc = (
-        f"{_filter_mode_label(params)}"
+        f"{_filter_mode_label(params)}|{_roll_mode_label(params)}"
         f"|otm{int(params.short_otm_pct * 1000)/10:.1f}|w{int(params.spread_width)}"
         f"|pt{int(params.profit_target_pct * 100)}|sl{params.stop_loss_mult:g}x"
     )
@@ -379,6 +481,7 @@ def run_sweep(
     profit_targets: Iterable[float] = PROFIT_TARGETS,
     stop_loss_mults: Iterable[float] = STOP_LOSS_MULTS,
     filter_modes: Iterable[tuple[str, bool, bool, str]] = FILTER_MODES,
+    roll_modes: Iterable[tuple[str, bool, int]] = ROLL_MODES,
     base_params: StrategyParams | None = None,
     client: PolygonClient | None = None,
     checkpoint_dir: "Path | None" = None,
@@ -392,13 +495,18 @@ def run_sweep(
     base = base_params or StrategyParams()
     all_rows: list[pd.DataFrame] = []
 
-    combos = [(mode_label, on_off, otm, w, pt, sl)
-              for mode_label, *on_off in filter_modes
-              for otm in short_otm_pcts
-              for w in spread_widths
-              for pt in profit_targets
-              for sl in stop_loss_mults]
-    for idx, (mode_label, on_off, otm, w, pt, sl) in enumerate(combos, 1):
+    combos = [
+        (mode_label, on_off, roll_label, roll_enabled, roll_max, otm, w, pt, sl)
+        for mode_label, *on_off in filter_modes
+        for roll_label, roll_enabled, roll_max in roll_modes
+        for otm in short_otm_pcts
+        for w in spread_widths
+        for pt in profit_targets
+        for sl in stop_loss_mults
+    ]
+    for idx, (
+        mode_label, on_off, roll_label, roll_enabled, roll_max, otm, w, pt, sl
+    ) in enumerate(combos, 1):
         overnight_on, premarket_on, combine = on_off
         params = StrategyParams(
             entry_time=base.entry_time,
@@ -415,6 +523,8 @@ def run_sweep(
             filter_combine=combine,  # type: ignore[arg-type]
             profit_target_pct=pt,
             stop_loss_mult=sl,
+            rolling_enabled=roll_enabled,
+            max_rolls=roll_max,
             commission_per_contract=base.commission_per_contract,
             leg_half_spread=base.leg_half_spread,
             starting_balance=base.starting_balance,
@@ -422,7 +532,7 @@ def run_sweep(
         )
         df = run_backtest(params, start, end, client=client)
         df["config"] = (
-            f"{mode_label}|otm{int(otm * 1000)/10:.1f}|w{int(w)}"
+            f"{mode_label}|{roll_label}|otm{int(otm * 1000)/10:.1f}|w{int(w)}"
             f"|pt{int(pt * 100)}|sl{sl:g}x"
         )
         all_rows.append(df)

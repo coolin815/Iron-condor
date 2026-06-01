@@ -56,6 +56,8 @@ def summarize_run(trades: pd.DataFrame, starting_balance: float) -> dict:
             "stop_exits": 0,
             "time_exits": 0,
             "hard_close_exits": 0,
+            "rolled_trades": 0,
+            "total_rolls": 0,
             "skipped_vix": int((trades["exit_reason"] == "vix_filter").sum()),
             "skipped_overnight": int((trades["exit_reason"] == "overnight_filter").sum()),
             "skipped_premarket": int((trades["exit_reason"] == "premarket_filter").sum()),
@@ -68,6 +70,14 @@ def summarize_run(trades: pd.DataFrame, starting_balance: float) -> dict:
     peak = equity.cummax()
     drawdown = (equity - peak) / peak
     max_dd = float(drawdown.min()) if not drawdown.empty else 0.0
+
+    if "roll_count" in taken.columns:
+        rc = pd.to_numeric(taken["roll_count"], errors="coerce").fillna(0)
+        rolled_trades = int((rc > 0).sum())
+        total_rolls = int(rc.sum())
+    else:
+        rolled_trades = 0
+        total_rolls = 0
 
     return {
         "starting_balance": starting_balance,
@@ -83,6 +93,8 @@ def summarize_run(trades: pd.DataFrame, starting_balance: float) -> dict:
         "stop_exits": int((taken["exit_reason"] == "stop").sum()),
         "time_exits": int((taken["exit_reason"] == "time_stop").sum()),
         "hard_close_exits": int((taken["exit_reason"] == "hard_close").sum()),
+        "rolled_trades": rolled_trades,
+        "total_rolls": total_rolls,
         "skipped_vix": int((trades["exit_reason"] == "vix_filter").sum()),
         "skipped_overnight": int((trades["exit_reason"] == "overnight_filter").sum()),
         "skipped_premarket": int((trades["exit_reason"] == "premarket_filter").sum()),
@@ -110,6 +122,8 @@ def summarize_sweep(sweep: pd.DataFrame, starting_balance: float) -> pd.DataFram
         "stop_exits",
         "time_exits",
         "hard_close_exits",
+        "rolled_trades",
+        "total_rolls",
         "skipped_vix",
         "skipped_overnight",
         "skipped_premarket",

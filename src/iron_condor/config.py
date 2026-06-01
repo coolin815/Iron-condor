@@ -50,6 +50,13 @@ class StrategyParams:
     profit_target_pct: float = 0.50        # % of credit captured to take profit
     stop_loss_mult: float = 2.0            # SL fires when unrealized loss = N × credit
 
+    # -- Rolling --
+    # When a stop fires intraday, instead of closing for a loss, close AND open
+    # a new spread at lower strikes (fresh OTM% from current spot) for the rest
+    # of today. Capped by max_rolls; never roll within 30 min of hard_close.
+    rolling_enabled: bool = False
+    max_rolls: int = 0
+
     # -- Execution --
     commission_per_contract: float = 0.85  # per leg per side — round trip = 4× this
     leg_half_spread: float = 0.01
@@ -72,4 +79,11 @@ FILTER_MODES: tuple[tuple[str, bool, bool, str], ...] = (
     ("premarket", False, True,  "any"),
     ("either",    True,  True,  "any"),
     ("both",      True,  True,  "all"),
+)
+
+# Rolling modes — (label, enabled, max_rolls). Sweep dimension to test whether
+# defensive same-day rolls into lower-strike spreads salvage stopped trades.
+ROLL_MODES: tuple[tuple[str, bool, int], ...] = (
+    ("noroll", False, 0),
+    ("roll2",  True,  2),
 )

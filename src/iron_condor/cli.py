@@ -18,6 +18,7 @@ from .backtest import run_backtest, run_sweep, simulate_day
 from .config import (
     FILTER_MODES,
     PROFIT_TARGETS,
+    ROLL_MODES,
     SHORT_OTM_PCTS,
     SPREAD_WIDTHS,
     STOP_LOSS_MULTS,
@@ -87,11 +88,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.sweep:
         n = (
-            len(FILTER_MODES) * len(SHORT_OTM_PCTS) * len(SPREAD_WIDTHS)
-            * len(PROFIT_TARGETS) * len(STOP_LOSS_MULTS)
+            len(FILTER_MODES) * len(ROLL_MODES) * len(SHORT_OTM_PCTS)
+            * len(SPREAD_WIDTHS) * len(PROFIT_TARGETS) * len(STOP_LOSS_MULTS)
         )
         print(
             f"Sweep: {n} configs (filter_modes={[m[0] for m in FILTER_MODES]}, "
+            f"roll_modes={[m[0] for m in ROLL_MODES]}, "
             f"short_otm={[f'{o*100:.1f}%' for o in SHORT_OTM_PCTS]}, "
             f"width={[f'${w:.0f}' for w in SPREAD_WIDTHS]}, "
             f"pt={[f'{p:.0%}' for p in PROFIT_TARGETS]}, "
